@@ -199,9 +199,7 @@ class BacktestEngine:
             if signal is not None and position is None:
                 # Open new position
                 entry_price = self._apply_slippage(row["close"], signal.get("direction", "long"))
-                position = self._open_position(
-                    signal, entry_price, current_time, equity
-                )
+                position = self._open_position(signal, entry_price, current_time, equity)
                 equity_curve.append(equity)  # Equity doesn't change on entry (only on exit)
 
         # Close any remaining position at last price
@@ -238,19 +236,23 @@ class BacktestEngine:
             train_end = current_start + pd.Timedelta(days=train_window_days)
             test_end = train_end + pd.Timedelta(days=test_window_days)
 
-            _train_data = data[(data["timestamp"] >= current_start) & (data["timestamp"] < train_end)]
+            _train_data = data[
+                (data["timestamp"] >= current_start) & (data["timestamp"] < train_end)
+            ]
             test_data = data[(data["timestamp"] >= train_end) & (data["timestamp"] < test_end)]
 
             if len(test_data) < 10:
                 break
 
             # Train on past data only
-            logger.info("walk_forward_window",
-                        window=window_idx,
-                        train_start=current_start.isoformat(),
-                        train_end=train_end.isoformat(),
-                        test_start=train_end.isoformat(),
-                        test_end=test_end.isoformat())
+            logger.info(
+                "walk_forward_window",
+                window=window_idx,
+                train_start=current_start.isoformat(),
+                train_end=train_end.isoformat(),
+                test_start=train_end.isoformat(),
+                test_end=test_end.isoformat(),
+            )
 
             # Run on test window
             result = self.run(test_data, strategy_fn, PeriodType.TEST)
@@ -271,8 +273,10 @@ class BacktestEngine:
     ) -> dict[str, Any]:
         """Open a simulated position."""
         direction = signal.get("direction", "long")
-        capital_pct = min(signal.get("size_pct", self.config.max_position_size_pct),
-                          self.config.max_position_size_pct)
+        capital_pct = min(
+            signal.get("size_pct", self.config.max_position_size_pct),
+            self.config.max_position_size_pct,
+        )
         capital = equity * capital_pct
         quantity = capital / entry_price
 
@@ -288,9 +292,7 @@ class BacktestEngine:
         if tp_pct:
             tp_pct = tp_pct / 100.0
             take_profit = (
-                entry_price * (1 + tp_pct)
-                if direction == "long"
-                else entry_price * (1 - tp_pct)
+                entry_price * (1 + tp_pct) if direction == "long" else entry_price * (1 - tp_pct)
             )
 
         return {
@@ -363,7 +365,9 @@ class BacktestEngine:
         result.total_trades = len(trades)
         result.winning_trades = sum(1 for t in trades if t.net_pnl > 0)
         result.losing_trades = sum(1 for t in trades if t.net_pnl <= 0)
-        result.win_rate = result.winning_trades / result.total_trades if result.total_trades > 0 else 0.0
+        result.win_rate = (
+            result.winning_trades / result.total_trades if result.total_trades > 0 else 0.0
+        )
         result.gross_pnl = sum(t.gross_pnl for t in trades)
         result.total_fees = sum(t.fees for t in trades)
         result.total_slippage = sum(t.slippage_cost for t in trades)
@@ -377,7 +381,9 @@ class BacktestEngine:
         result.max_drawdown_pct = self._max_drawdown(equity_curve)
         result.sharpe_ratio = self._sharpe_ratio(equity_curve)
         result.sortino_ratio = self._sortino_ratio(equity_curve)
-        result.avg_trade_return_pct = float(np.mean([t.return_pct for t in trades])) if trades else 0.0
+        result.avg_trade_return_pct = (
+            float(np.mean([t.return_pct for t in trades])) if trades else 0.0
+        )
         result.avg_win_pct = (
             float(np.mean([t.return_pct for t in trades if t.net_pnl > 0]))
             if result.winning_trades > 0

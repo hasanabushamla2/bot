@@ -2,7 +2,7 @@
 
 ## Quant Opportunity Engine — System Architecture
 
-Version: 0.1.0 | Phase 1
+Version: 0.1.0 | Phase 1 (including Portfolio Subsystem)
 
 ---
 
@@ -23,6 +23,8 @@ Every major component is an independent, testable module. No component makes ass
 4. **Realism**: Backtesting and paper trading use the same code paths as live trading. No simplified "fast path" that would exaggerate performance.
 
 5. **Auditability**: Every order has a trace explaining WHY it was placed — which strategy, which signal, what score, what risk assessment.
+
+6. **Liquidity-Aware Capital Scaling**: As account equity grows, the system intelligently distributes capital across multiple liquid instruments, markets, exchanges, and independent strategies. Horizontal scaling (more opportunities) is preferred over vertical scaling (larger single positions). The Portfolio / Capital Allocation subsystem enforces this automatically.
 
 ---
 
@@ -74,6 +76,14 @@ Every major component is an independent, testable module. No component makes ass
 │  Kill switch │ Correlation limits │ Stop-loss enforcement       │
 └──────────────────────────┬───────────────────────────────────────┘
                            │ Approved Opportunities
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│              PORTFOLIO / CAPITAL ALLOCATION SUBSYSTEM             │
+│  Liquidity Analyzer  │  Capacity Estimator  │  Correlation       │
+│  Universe Manager  │  Capital Allocator  │  Concentration ctrl  │
+│  Equity scaling  │  Order splitting  │  Rebalancing            │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ Allocation Decisions
                            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                     EXECUTION ENGINE                              │
@@ -173,7 +183,15 @@ Every major component is an independent, testable module. No component makes ass
 - Strategy/market/exchange breakdowns.
 - All numbers from actual data — never fabricated.
 
-### 3.12 Dashboard (`src/dashboard/`)
+### 3.12 Portfolio / Capital Allocation (`src/portfolio/`)
+- **liquidity.py**: `LiquidityAnalyzer` — order-book depth, spread, volume, market-impact estimation using square-root model. Produces `LiquidityMetrics` with depth-at-bps, impact-at-notional, and composite liquidity scores.
+- **capacity.py**: `CapacityEstimator` — liquidity-aware maximum efficient position size. Estimates net edge at increasing notional sizes, finds the point where marginal edge falls below threshold. Produces `PositionCapacity` and `STRATEGY_CAPACITY` reports.
+- **correlation.py**: `CorrelationTracker` — pairwise Pearson correlation matrix from rolling log returns. Computes diversification scores and correlation penalties for allocation decisions.
+- **universe.py**: `UniverseManager` — dynamic tradable-universe with per-asset eligibility: spread, volume, liquidity, volatility, data-health checks. Auto-adds/removes assets. Statuses: ACTIVE, WATCH, SUSPENDED, REJECTED, DEGRADED.
+- **allocator.py**: `CapitalAllocator` — the brain of portfolio-level decision making. Distributes capital across opportunities using Fractional Kelly, equal-risk, or score-weighted sizing. Enforces concentration limits per asset, strategy, and exchange. Supports periodic rebalancing.
+- **Key Principle**: Account equity growth → smarter capital distribution across independent opportunities, NOT blindly larger individual positions.
+
+### 3.13 Dashboard (`src/dashboard/`)
 - FastAPI-based internal monitoring dashboard.
 - Real-time equity, P&L, positions, opportunities.
 - Paper/Live mode indicator — CANNOT be confused.
@@ -187,14 +205,18 @@ Every major component is an independent, testable module. No component makes ass
 
 ```
 1. WebSocket ticker arrives → Data Engine normalizes → Scanner
-2. Scanner routes to subscribed Strategy plugins
-3. Strategy.analyze() produces Signal (or None)
-4. Opportunity Engine scores Signal → Opportunity
-5. Risk Engine assesses Opportunity → Approved/Rejected
-6. Execution Engine places order → Exchange
-7. Fill confirmation → Position Manager updates state
-8. Analytics Tracker records trade metrics
-9. Dashboard updates in real-time
+2. Universe Manager filters to tradable assets only
+3. Scanner routes to subscribed Strategy plugins
+4. Strategy.analyze() produces Signal (or None)
+5. Liquidity Analyzer + Capacity Estimator assess position viability
+6. Opportunity Engine scores Signal → Opportunity
+7. Risk Engine assesses Opportunity → Approved/Rejected
+8. Capital Allocator distributes capital across approved opportunities
+9. Execution Engine places order → Exchange
+10. Fill confirmation → Position Manager updates state
+11. Correlation Tracker updates matrix from price data
+12. Analytics Tracker records trade + portfolio metrics
+13. Dashboard updates in real-time
 ```
 
 ### Latency Budget (Target)
@@ -204,8 +226,10 @@ Every major component is an independent, testable module. No component makes ass
 | WebSocket → Normalized | < 5ms |
 | Normalize → Strategy Input | < 1ms |
 | Strategy Analysis | < 10ms |
+| Liquidity + Capacity | < 5ms |
 | Opportunity Scoring | < 5ms |
 | Risk Assessment | < 2ms |
+| Capital Allocation | < 3ms |
 | Order Placement (API call) | < 100ms |
 | **Total Signal → Order** | **< 150ms** |
 

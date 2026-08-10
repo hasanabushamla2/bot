@@ -155,12 +155,14 @@ class PaperExecutionEngine:
         self.account.total_fees += fees
         self._orders[request.client_order_id] = order
 
-        logger.info("paper_order_filled",
-                     symbol=request.symbol,
-                     side=request.side.value,
-                     quantity=request.quantity,
-                     price=fill_price,
-                     fees=fees)
+        logger.info(
+            "paper_order_filled",
+            symbol=request.symbol,
+            side=request.side.value,
+            quantity=request.quantity,
+            price=fill_price,
+            fees=fees,
+        )
 
         return order
 
@@ -209,8 +211,7 @@ class PaperExecutionEngine:
             metadata={"rejection_reason": reason},
         )
         self._orders[request.client_order_id] = order
-        logger.warning("paper_order_rejected",
-                       symbol=request.symbol, reason=reason)
+        logger.warning("paper_order_rejected", symbol=request.symbol, reason=reason)
         return order
 
     def get_account_summary(self) -> dict[str, Any]:

@@ -30,14 +30,10 @@ class TestValidTransitions:
         assert OrderStateMachine.can_transition(OrderState.OPEN, OrderState.EXPIRED)
 
     def test_partially_filled_to_filled(self) -> None:
-        assert OrderStateMachine.can_transition(
-            OrderState.PARTIALLY_FILLED, OrderState.FILLED
-        )
+        assert OrderStateMachine.can_transition(OrderState.PARTIALLY_FILLED, OrderState.FILLED)
 
     def test_partially_filled_to_canceled(self) -> None:
-        assert OrderStateMachine.can_transition(
-            OrderState.PARTIALLY_FILLED, OrderState.CANCELED
-        )
+        assert OrderStateMachine.can_transition(OrderState.PARTIALLY_FILLED, OrderState.CANCELED)
 
     def test_partially_filled_to_more_partial(self) -> None:
         """Partial fill → partial fill is valid (more quantity fills)."""

@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 @dataclass
 class DailyMetrics:
     """Single day's trading metrics."""
+
     date: str
     total_opportunities: int = 0
     opportunities_rejected: int = 0
@@ -36,11 +37,18 @@ class DailyMetrics:
     slippage: float = 0.0
     avg_trade_return_pct: float = 0.0
     daily_return_pct: float = 0.0
+    # Portfolio metrics
+    capital_utilization_pct: float = 0.0
+    unused_capital: float = 0.0
+    allocation_by_asset: dict[str, float] = field(default_factory=dict)
+    allocation_by_strategy: dict[str, float] = field(default_factory=dict)
+    allocation_by_exchange: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class CumulativeMetrics:
     """Running cumulative metrics since inception."""
+
     total_opportunities: int = 0
     opportunities_rejected: int = 0
     total_trades: int = 0
@@ -67,6 +75,17 @@ class CumulativeMetrics:
     order_rejection_rate: float = 0.0
     avg_execution_latency_ms: float = 0.0
     avg_signal_to_order_latency_ms: float = 0.0
+
+    # Portfolio / capacity metrics
+    capital_utilization_pct: float = 0.0
+    unused_capital: float = 0.0
+    allocation_by_asset: dict[str, float] = field(default_factory=dict)
+    allocation_by_strategy: dict[str, float] = field(default_factory=dict)
+    allocation_by_exchange: dict[str, float] = field(default_factory=dict)
+    estimated_market_impact_bps: float = 0.0
+    capacity_utilization_pct: float = 0.0
+    concentration_hhi: float = 0.0  # Herfindahl-Hirschman Index
+    correlation_exposure_pct: float = 0.0
 
     # Breakdowns
     strategy_performance: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -115,6 +134,15 @@ class AnalyticsTracker:
         self._market_pnl: dict[str, float] = {}
         self._exchange_pnl: dict[str, float] = {}
 
+        # Portfolio allocation tracking
+        self._allocation_by_asset: dict[str, float] = {}
+        self._allocation_by_strategy: dict[str, float] = {}
+        self._allocation_by_exchange: dict[str, float] = {}
+        self._total_allocated = 0.0
+        self._total_equity_latest = 0.0
+        self._market_impacts: list[float] = []
+        self._capacity_utilizations: list[float] = []
+
     # --- Record Methods ---
 
     def record_opportunity(self, rejected: bool = False) -> None:
@@ -159,7 +187,10 @@ class AnalyticsTracker:
         if strategy_id:
             self._strategy_pnl[strategy_id] = self._strategy_pnl.get(strategy_id, 0.0) + net_pnl
             wins, losses = self._strategy_trades.get(strategy_id, (0, 0))
-            self._strategy_trades[strategy_id] = (wins + (1 if is_win else 0), losses + (0 if is_win else 1))
+            self._strategy_trades[strategy_id] = (
+                wins + (1 if is_win else 0),
+                losses + (0 if is_win else 1),
+            )
 
         # Market breakdown
         if market:
@@ -185,6 +216,33 @@ class AnalyticsTracker:
     def record_latency(self, execution_ms: float, signal_to_order_ms: float) -> None:
         self._execution_latencies.append(execution_ms)
         self._signal_to_order_latencies.append(signal_to_order_ms)
+
+    def record_allocation(
+        self,
+        asset: str,
+        strategy_id: str,
+        exchange: str,
+        allocated: float,
+        market_impact_bps: float = 0.0,
+        capacity_utilization_pct: float = 0.0,
+    ) -> None:
+        """Record capital allocation for portfolio metrics."""
+        self._allocation_by_asset[asset] = self._allocation_by_asset.get(asset, 0.0) + allocated
+        self._allocation_by_strategy[strategy_id] = (
+            self._allocation_by_strategy.get(strategy_id, 0.0) + allocated
+        )
+        self._allocation_by_exchange[exchange] = (
+            self._allocation_by_exchange.get(exchange, 0.0) + allocated
+        )
+        self._total_allocated += allocated
+        if market_impact_bps > 0:
+            self._market_impacts.append(market_impact_bps)
+        if capacity_utilization_pct > 0:
+            self._capacity_utilizations.append(capacity_utilization_pct)
+
+    def record_equity(self, equity: float) -> None:
+        """Record latest equity for utilization calculations."""
+        self._total_equity_latest = equity
 
     # --- Compute Methods ---
 
@@ -225,9 +283,17 @@ class AnalyticsTracker:
         daily_vals = list(self._daily_pnl.values())
         if len(daily_vals) >= 2:
             daily_returns = np.array(daily_vals) / initial_capital
-            m.sharpe_ratio = float(np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)) if np.std(daily_returns) > 0 else 0.0
+            m.sharpe_ratio = (
+                float(np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252))
+                if np.std(daily_returns) > 0
+                else 0.0
+            )
             downside = daily_returns[daily_returns < 0]
-            m.sortino_ratio = float(np.mean(daily_returns) / np.std(downside) * np.sqrt(252)) if len(downside) > 0 and np.std(downside) > 0 else 0.0
+            m.sortino_ratio = (
+                float(np.mean(daily_returns) / np.std(downside) * np.sqrt(252))
+                if len(downside) > 0 and np.std(downside) > 0
+                else 0.0
+            )
             m.avg_daily_return_pct = float(np.mean(daily_returns) * 100)
 
         # Compounded return
@@ -239,13 +305,38 @@ class AnalyticsTracker:
             float(np.mean(self._execution_latencies)) if self._execution_latencies else 0.0
         )
         m.avg_signal_to_order_latency_ms = (
-            float(np.mean(self._signal_to_order_latencies)) if self._signal_to_order_latencies else 0.0
+            float(np.mean(self._signal_to_order_latencies))
+            if self._signal_to_order_latencies
+            else 0.0
         )
 
         # Fill ratio
         total_orders = self._total_fills + self._orders_rejected
         m.fill_ratio = self._total_fills / total_orders if total_orders > 0 else 1.0
         m.order_rejection_rate = self._orders_rejected / total_orders if total_orders > 0 else 0.0
+
+        # --- Portfolio / capacity metrics ---
+        m.capital_utilization_pct = (
+            self._total_allocated / self._total_equity_latest * 100
+            if self._total_equity_latest > 0
+            else 0.0
+        )
+        m.unused_capital = max(0.0, self._total_equity_latest - self._total_allocated)
+        m.allocation_by_asset = dict(self._allocation_by_asset)
+        m.allocation_by_strategy = dict(self._allocation_by_strategy)
+        m.allocation_by_exchange = dict(self._allocation_by_exchange)
+        m.estimated_market_impact_bps = (
+            float(np.mean(self._market_impacts)) if self._market_impacts else 0.0
+        )
+        m.capacity_utilization_pct = (
+            float(np.mean(self._capacity_utilizations)) if self._capacity_utilizations else 0.0
+        )
+        # HHI for asset concentration
+        if self._allocation_by_asset and self._total_allocated > 0:
+            m.concentration_hhi = sum(
+                (v / self._total_allocated * 100) ** 2 for v in self._allocation_by_asset.values()
+            )
+        m.correlation_exposure_pct = 0.0  # Populated by CorrelationTracker when available
 
         # Breakdowns
         for sid, pnl in self._strategy_pnl.items():

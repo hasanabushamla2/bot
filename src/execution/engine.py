@@ -144,8 +144,7 @@ class ExecutionEngine:
         # --- Idempotency Check ---
         idem_key = request.idempotency_key()
         if idem_key in self._idempotency_keys:
-            logger.warning("duplicate_order_prevented",
-                           idempotency_key=idem_key, symbol=symbol)
+            logger.warning("duplicate_order_prevented", idempotency_key=idem_key, symbol=symbol)
             raise DuplicateOrderError(f"Order already placed: {idem_key}")
 
         self._idempotency_keys.add(idem_key)
@@ -169,15 +168,17 @@ class ExecutionEngine:
 
                 latency = (datetime.now(UTC) - start_time).total_seconds() * 1000
 
-                logger.info("order_placed",
-                            exchange=exchange_name,
-                            symbol=symbol,
-                            side=side.value,
-                            order_id=result_order.client_order_id,
-                            exchange_order_id=result_order.exchange_order_id,
-                            state=result_order.state.value,
-                            latency_ms=round(latency, 2),
-                            attempt=attempt + 1)
+                logger.info(
+                    "order_placed",
+                    exchange=exchange_name,
+                    symbol=symbol,
+                    side=side.value,
+                    order_id=result_order.client_order_id,
+                    exchange_order_id=result_order.exchange_order_id,
+                    state=result_order.state.value,
+                    latency_ms=round(latency, 2),
+                    attempt=attempt + 1,
+                )
 
                 return ExecutionResult(
                     success=True,
@@ -188,15 +189,17 @@ class ExecutionEngine:
 
             except TimeoutError:
                 last_error = f"Order timed out after {self.order_timeout_seconds}s"
-                logger.warning("order_timeout",
-                               exchange=exchange_name, symbol=symbol, attempt=attempt + 1)
+                logger.warning(
+                    "order_timeout", exchange=exchange_name, symbol=symbol, attempt=attempt + 1
+                )
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    await asyncio.sleep(2**attempt)  # Exponential backoff
 
             except OrderRejectedError as e:
                 last_error = str(e)
-                logger.warning("order_rejected",
-                               exchange=exchange_name, symbol=symbol, reason=str(e))
+                logger.warning(
+                    "order_rejected", exchange=exchange_name, symbol=symbol, reason=str(e)
+                )
                 break  # Don't retry rejected orders
 
             except RateLimitError as e:
@@ -226,12 +229,10 @@ class ExecutionEngine:
 
         try:
             result = await adapter.cancel_order(order_id, symbol)
-            logger.info("order_canceled",
-                        exchange=exchange_name, order_id=order_id, symbol=symbol)
+            logger.info("order_canceled", exchange=exchange_name, order_id=order_id, symbol=symbol)
             return ExecutionResult(success=True, order=result)
         except Exception as e:
-            logger.error("cancel_failed",
-                         exchange=exchange_name, order_id=order_id, error=str(e))
+            logger.error("cancel_failed", exchange=exchange_name, order_id=order_id, error=str(e))
             return ExecutionResult(success=False, error=str(e))
 
     # --- Reconciliation ---
@@ -271,9 +272,11 @@ class ExecutionEngine:
                             local_order.exchange_order_id, local_order.symbol
                         )
                         self._active_orders[local_order.client_order_id] = updated
-                        logger.info("reconciled_order",
-                                    client_id=local_order.client_order_id,
-                                    new_state=updated.state.value)
+                        logger.info(
+                            "reconciled_order",
+                            client_id=local_order.client_order_id,
+                            new_state=updated.state.value,
+                        )
                     except Exception as e:
                         errors.append(
                             ReconciliationError(
@@ -296,9 +299,7 @@ class ExecutionEngine:
                 raise RateLimitError(f"Rate limit for {exchange_name} — retry after {reset_time}")
         else:
             self._rate_limit_counters[exchange_name] = 0
-            self._rate_limit_reset_times[exchange_name] = now.replace(
-                second=now.second + 1
-            )
+            self._rate_limit_reset_times[exchange_name] = now.replace(second=now.second + 1)
         self._rate_limit_counters[exchange_name] = (
             self._rate_limit_counters.get(exchange_name, 0) + 1
         )
@@ -307,10 +308,7 @@ class ExecutionEngine:
 
     def get_active_orders(self, exchange_name: str | None = None) -> list[NormalizedOrder]:
         """Get all active (non-terminal) orders, optionally filtered by exchange."""
-        active = [
-            o for o in self._active_orders.values()
-            if OrderStateMachine.is_active(o.state)
-        ]
+        active = [o for o in self._active_orders.values() if OrderStateMachine.is_active(o.state)]
         if exchange_name:
             active = [o for o in active if o.exchange == exchange_name]
         return active

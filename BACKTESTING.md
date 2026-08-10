@@ -150,7 +150,28 @@ results = engine.walk_forward(data, my_strategy_fn, train_window_days=90, test_w
 
 ---
 
-## 8. Validation Checklist
+## 8. Capacity Testing & Strategy Capacity Reports
+
+The backtesting system supports capacity analysis — estimating how strategy performance degrades as capital grows.
+
+For each strategy, estimate:
+- Expected return at different capital levels ($1k, $10k, $100k, $1M)
+- Slippage at different order sizes
+- Liquidity limitations
+- Degradation of edge as capital grows
+
+The `CapacityEstimator.capacity_report()` generates a `STRATEGY_CAPACITY` report:
+
+```
+Strategy A:  efficient at $1k, $10k;  degrades at $100k;  not viable at $1M
+Strategy B:  efficient at $1k, $10k, $100k;  marginal at $1M
+```
+
+**Numbers must come from data/simulation, never fabricated.** Actual thresholds validated in paper trading before live use.
+
+---
+
+## 9. Validation Checklist
 
 Before trusting any backtest result:
 

@@ -25,14 +25,16 @@ def make_ohlcv_data(
         price *= np.exp(np.random.normal(0, 0.002))
         prices.append(price)
 
-    return pd.DataFrame({
-        "timestamp": dates,
-        "open": prices,
-        "high": [p * 1.002 for p in prices],
-        "low": [p * 0.998 for p in prices],
-        "close": prices,
-        "volume": np.random.uniform(1, 100, n_rows),
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": dates,
+            "open": prices,
+            "high": [p * 1.002 for p in prices],
+            "low": [p * 0.998 for p in prices],
+            "close": prices,
+            "volume": np.random.uniform(1, 100, n_rows),
+        }
+    )
 
 
 class TestBacktestEngine:
@@ -118,14 +120,16 @@ class TestBacktestEngine:
         # Create data with a sharp drop then recovery
         dates = pd.date_range("2024-01-01", periods=50, freq="1min")
         prices = [50000.0] * 10 + [49500.0] * 5 + [51000.0] * 35
-        data = pd.DataFrame({
-            "timestamp": dates,
-            "open": prices,
-            "high": [p * 1.001 for p in prices],
-            "low": [p * 0.999 for p in prices],
-            "close": prices,
-            "volume": [10.0] * 50,
-        })
+        data = pd.DataFrame(
+            {
+                "timestamp": dates,
+                "open": prices,
+                "high": [p * 1.001 for p in prices],
+                "low": [p * 0.999 for p in prices],
+                "close": prices,
+                "volume": [10.0] * 50,
+            }
+        )
 
         def always_long(df: pd.DataFrame) -> dict | None:
             if len(df) >= 5:

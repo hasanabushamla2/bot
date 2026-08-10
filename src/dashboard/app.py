@@ -130,63 +130,63 @@ async def dashboard() -> str:
       <span>Engine: Running</span>
     </div>
     <div class="status-item">
-      <div class="status-dot {'ok' if _dashboard_state['data_health'] == 'healthy' else 'warn'}"></div>
-      <span>Data: {_dashboard_state['data_health']}</span>
+      <div class="status-dot {"ok" if _dashboard_state["data_health"] == "healthy" else "warn"}"></div>
+      <span>Data: {_dashboard_state["data_health"]}</span>
     </div>
     <div style="margin-left: auto; color: #64748b;">
-      Updated: {_dashboard_state.get('last_updated', 'N/A')}
+      Updated: {_dashboard_state.get("last_updated", "N/A")}
     </div>
   </div>
 
   <div class="grid">
     <div class="card">
       <h3>Equity</h3>
-      <div class="value">${_dashboard_state['equity']:,.2f}</div>
+      <div class="value">${_dashboard_state["equity"]:,.2f}</div>
     </div>
     <div class="card">
       <h3>Daily P&L</h3>
-      <div class="value {'positive' if _dashboard_state['daily_pnl'] >= 0 else 'negative'}">
-        ${_dashboard_state['daily_pnl']:,.2f}
+      <div class="value {"positive" if _dashboard_state["daily_pnl"] >= 0 else "negative"}">
+        ${_dashboard_state["daily_pnl"]:,.2f}
       </div>
     </div>
     <div class="card">
       <h3>Cumulative P&L</h3>
-      <div class="value {'positive' if _dashboard_state['cumulative_pnl'] >= 0 else 'negative'}">
-        ${_dashboard_state['cumulative_pnl']:,.2f}
+      <div class="value {"positive" if _dashboard_state["cumulative_pnl"] >= 0 else "negative"}">
+        ${_dashboard_state["cumulative_pnl"]:,.2f}
       </div>
     </div>
     <div class="card">
       <h3>Active Positions</h3>
-      <div class="value">{_dashboard_state['active_positions']}</div>
+      <div class="value">{_dashboard_state["active_positions"]}</div>
     </div>
     <div class="card">
       <h3>Opportunities Today</h3>
-      <div class="value">{_dashboard_state['opportunities_today']}</div>
+      <div class="value">{_dashboard_state["opportunities_today"]}</div>
     </div>
     <div class="card">
       <h3>Trades Today</h3>
-      <div class="value">{_dashboard_state['trades_today']}</div>
+      <div class="value">{_dashboard_state["trades_today"]}</div>
     </div>
     <div class="card">
       <h3>Win Rate</h3>
-      <div class="value">{_dashboard_state['win_rate']:.1%}</div>
+      <div class="value">{_dashboard_state["win_rate"]:.1%}</div>
     </div>
     <div class="card">
       <h3>Fees Today</h3>
-      <div class="value">${_dashboard_state['fees_today']:,.2f}</div>
+      <div class="value">${_dashboard_state["fees_today"]:,.2f}</div>
     </div>
-    <div class="card {'bad' if _dashboard_state['drawdown_pct'] > 5 else 'good'}">
+    <div class="card {"bad" if _dashboard_state["drawdown_pct"] > 5 else "good"}">
       <h3>Max Drawdown</h3>
-      <div class="value">{_dashboard_state['drawdown_pct']:.2f}%</div>
+      <div class="value">{_dashboard_state["drawdown_pct"]:.2f}%</div>
     </div>
     <div class="card">
       <h3>Sharpe Ratio</h3>
-      <div class="value">{_dashboard_state['sharpe_ratio']:.2f}</div>
+      <div class="value">{_dashboard_state["sharpe_ratio"]:.2f}</div>
     </div>
     <div class="card">
       <h3>Errors Today</h3>
-      <div class="value {'bad' if _dashboard_state['errors_today'] > 0 else ''}">
-        {_dashboard_state['errors_today']}
+      <div class="value {"bad" if _dashboard_state["errors_today"] > 0 else ""}">
+        {_dashboard_state["errors_today"]}
       </div>
     </div>
   </div>

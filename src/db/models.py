@@ -176,9 +176,7 @@ class Signal(Base):
     instrument_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
     market: Mapped[str | None] = mapped_column(String(32))
     symbol: Mapped[str | None] = mapped_column(String(32))
-    direction: Mapped[SignalDirection] = mapped_column(
-        Enum(SignalDirection), nullable=False
-    )
+    direction: Mapped[SignalDirection] = mapped_column(Enum(SignalDirection), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     estimated_return: Mapped[float | None] = mapped_column(Float)
     estimated_risk: Mapped[float | None] = mapped_column(Float)
@@ -248,7 +246,9 @@ class Order(Base):
         String(64), unique=True, nullable=False, index=True
     )
     exchange_order_id: Mapped[str | None] = mapped_column(String(64), index=True)
-    opportunity_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), ForeignKey("opportunities.id"))
+    opportunity_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("opportunities.id")
+    )
     strategy_id: Mapped[str | None] = mapped_column(String(64))
     exchange_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
     instrument_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
@@ -398,7 +398,9 @@ class AuditEvent(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=new_uuid)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    severity: Mapped[str] = mapped_column(String(16), default="INFO")  # INFO, WARNING, ERROR, CRITICAL
+    severity: Mapped[str] = mapped_column(
+        String(16), default="INFO"
+    )  # INFO, WARNING, ERROR, CRITICAL
     component: Mapped[str] = mapped_column(String(64), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

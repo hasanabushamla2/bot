@@ -51,9 +51,7 @@ class TestOpportunityEvaluation:
 
     def test_expired_signal_rejected(self) -> None:
         engine = OpportunityEngine()
-        signal = make_signal(
-            signal_expires_at=datetime.now(UTC) - timedelta(seconds=10)
-        )
+        signal = make_signal(signal_expires_at=datetime.now(UTC) - timedelta(seconds=10))
         opp = engine.evaluate(signal)
         assert opp.status.value == "rejected"
 

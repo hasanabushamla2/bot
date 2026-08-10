@@ -72,7 +72,9 @@ class OrderStateMachine:
         return state in {OrderState.OPEN, OrderState.PARTIALLY_FILLED}
 
     @classmethod
-    def transition(cls, from_state: OrderState, to_state: OrderState, order_id: str = "") -> OrderState:
+    def transition(
+        cls, from_state: OrderState, to_state: OrderState, order_id: str = ""
+    ) -> OrderState:
         """Validate and execute a state transition.
 
         Raises:

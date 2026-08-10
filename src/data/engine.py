@@ -35,6 +35,7 @@ logger = get_logger(__name__)
 @dataclass
 class DataHealth:
     """Health status of a data stream."""
+
     exchange: str
     symbol: str
     stream_type: str  # "ticker", "order_book", "trades"
@@ -94,7 +95,8 @@ class RealTimeDataEngine:
         """Return streams that are currently stale."""
         now = datetime.now(UTC)
         return [
-            h for h in self._health.values()
+            h
+            for h in self._health.values()
             if h.last_message_at is None
             or (now - h.last_message_at).total_seconds() > self.stale_threshold_seconds
         ]
@@ -127,9 +129,13 @@ class RealTimeDataEngine:
                     self.reconnect_base_delay * (2 ** self._health[stream_key].reconnect_count),
                     self.reconnect_max_delay,
                 )
-                logger.warning("ticker_stream_error",
-                               exchange=exchange_name, symbol=symbol,
-                               error=str(e), reconnect_delay=delay)
+                logger.warning(
+                    "ticker_stream_error",
+                    exchange=exchange_name,
+                    symbol=symbol,
+                    error=str(e),
+                    reconnect_delay=delay,
+                )
                 await asyncio.sleep(delay)
                 # Will loop and retry
 
@@ -159,9 +165,13 @@ class RealTimeDataEngine:
                     self.reconnect_base_delay * (2 ** self._health[stream_key].reconnect_count),
                     self.reconnect_max_delay,
                 )
-                logger.warning("order_book_stream_error",
-                               exchange=exchange_name, symbol=symbol,
-                               error=str(e), reconnect_delay=delay)
+                logger.warning(
+                    "order_book_stream_error",
+                    exchange=exchange_name,
+                    symbol=symbol,
+                    error=str(e),
+                    reconnect_delay=delay,
+                )
                 await asyncio.sleep(delay)
 
     # --- Trade Stream ---
@@ -189,9 +199,13 @@ class RealTimeDataEngine:
                     self.reconnect_base_delay * (2 ** self._health[stream_key].reconnect_count),
                     self.reconnect_max_delay,
                 )
-                logger.warning("trade_stream_error",
-                               exchange=exchange_name, symbol=symbol,
-                               error=str(e), reconnect_delay=delay)
+                logger.warning(
+                    "trade_stream_error",
+                    exchange=exchange_name,
+                    symbol=symbol,
+                    error=str(e),
+                    reconnect_delay=delay,
+                )
                 await asyncio.sleep(delay)
 
     # --- REST Fallbacks ---
@@ -217,8 +231,9 @@ class RealTimeDataEngine:
         try:
             return await adapter.get_order_book(symbol, depth)
         except Exception as e:
-            logger.error("rest_order_book_failed",
-                         exchange=exchange_name, symbol=symbol, error=str(e))
+            logger.error(
+                "rest_order_book_failed", exchange=exchange_name, symbol=symbol, error=str(e)
+            )
             return None
 
     # --- Order Book Access ---

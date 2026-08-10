@@ -35,6 +35,7 @@ class RiskDecision(str, Enum):
 
 class RejectionReason(str, Enum):
     """Why the risk engine rejected an opportunity."""
+
     MAX_EXPOSURE = "max_exposure"
     PER_MARKET_EXPOSURE = "per_market_exposure"
     PER_STRATEGY_EXPOSURE = "per_strategy_exposure"
@@ -162,8 +163,11 @@ class RiskEngine:
         required_capital = opportunity.signal.required_capital or self.max_position_size_usd
         if self.state.total_exposure + required_capital > self.max_total_exposure_usd:
             assessment.reason = RejectionReason.MAX_EXPOSURE
-            logger.info("risk_rejected_max_exposure",
-                        current=self.state.total_exposure, required=required_capital)
+            logger.info(
+                "risk_rejected_max_exposure",
+                current=self.state.total_exposure,
+                required=required_capital,
+            )
             return assessment
 
         # --- Gate 4: Per-Strategy Limits ---
@@ -196,26 +200,30 @@ class RiskEngine:
 
         # --- Gate 8: Stop Loss ---
         signal = opportunity.signal
-        stop_loss_pct: float = float(signal.metadata.get("stop_loss_pct", self.default_stop_loss_pct))
+        stop_loss_pct: float = float(
+            signal.metadata.get("stop_loss_pct", self.default_stop_loss_pct)
+        )
         assessment.stop_loss_price = self._compute_stop_loss(signal, stop_loss_pct)
 
         # --- Gate 9: Take Profit ---
         take_profit_pct_raw = signal.metadata.get("take_profit_pct", None)
         if take_profit_pct_raw is not None:
-            assessment.take_profit_price = self._compute_take_profit(signal, float(take_profit_pct_raw))
+            assessment.take_profit_price = self._compute_take_profit(
+                signal, float(take_profit_pct_raw)
+            )
 
         # --- PASSED ---
         assessment.decision = RiskDecision.APPROVED
-        logger.info("risk_approved",
-                     strategy=strategy_id,
-                     symbol=opportunity.signal.symbol,
-                     position_size=position_size)
+        logger.info(
+            "risk_approved",
+            strategy=strategy_id,
+            symbol=opportunity.signal.symbol,
+            position_size=position_size,
+        )
 
         return assessment
 
-    def assess_batch(
-        self, opportunities: list[EvaluatedOpportunity]
-    ) -> list[RiskAssessment]:
+    def assess_batch(self, opportunities: list[EvaluatedOpportunity]) -> list[RiskAssessment]:
         """Evaluate a batch of ranked opportunities.
 
         Returns only approved assessments, respecting exposure limits
@@ -229,9 +237,11 @@ class RiskEngine:
                 # Reserve exposure for this approved opportunity
                 self._reserve_exposure(assessment)
             else:
-                logger.debug("risk_rejected",
-                             strategy=opp.signal.strategy_id,
-                             reason=assessment.reason.value if assessment.reason else "unknown")
+                logger.debug(
+                    "risk_rejected",
+                    strategy=opp.signal.strategy_id,
+                    reason=assessment.reason.value if assessment.reason else "unknown",
+                )
         return results
 
     # --- State Updates ---
@@ -275,9 +285,7 @@ class RiskEngine:
 
     # --- Helpers ---
 
-    def _compute_stop_loss(
-        self, signal: StrategySignal, stop_loss_pct: float
-    ) -> float | None:
+    def _compute_stop_loss(self, signal: StrategySignal, stop_loss_pct: float) -> float | None:
         """Compute stop loss price based on signal direction and percentage."""
         ticker_price_raw = signal.metadata.get("entry_price")
         if ticker_price_raw is None:
@@ -289,9 +297,7 @@ class RiskEngine:
         else:
             return ticker_price * (1 + pct)
 
-    def _compute_take_profit(
-        self, signal: StrategySignal, take_profit_pct: float
-    ) -> float | None:
+    def _compute_take_profit(self, signal: StrategySignal, take_profit_pct: float) -> float | None:
         """Compute take profit price."""
         ticker_price_raw = signal.metadata.get("entry_price")
         if ticker_price_raw is None:

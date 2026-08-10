@@ -142,7 +142,38 @@ RISK_CIRCUIT_BREAKER_CONSECUTIVE_LOSSES=7
 
 ---
 
-## 12. Research Note on Daily Return Targets
+## 12. Capital Allocation & Concentration Controls
+
+The Portfolio / Capital Allocation subsystem complements the Risk Engine with:
+
+### Concentration Limits (configurable)
+
+| Limit | Default | Description |
+|-------|---------|-------------|
+| Max single position | 10% of equity | Ceiling per individual position |
+| Max single asset | 20% of equity | BTC, ETH, SOL, etc. |
+| Max single strategy | 25% of equity | Per strategy across all assets |
+| Max single exchange | 40% of equity | Per exchange across all strategies |
+| Max correlated exposure | 30% of equity | Highly correlated positions summed |
+| Reserve | 5% of equity | Always kept as cash buffer |
+
+### Liquidity-Aware Sizing
+
+The `CapacityEstimator` prevents positions from exceeding the maximum efficient size where expected net edge drops below the minimum threshold. As account equity grows, the system automatically distributes across more instruments rather than increasing individual position sizes.
+
+### Diversification Scoring
+
+The `CorrelationTracker` computes pairwise correlations and applies:
+- **Diversification bonus**: Uncorrelated additions receive a scoring bonus
+- **Correlation penalty**: Highly correlated positions (>0.7) receive reduced allocation
+
+### Rebalancing
+
+The allocator periodically reassesses the portfolio. By default, it does NOT close winning positions — it only reallocates unused capital and flags positions that have drifted beyond concentration limits.
+
+---
+
+## 13. Research Note on Daily Return Targets
 
 The system has a research KPI of approximately 2%–2.5% average daily net return, but:
 

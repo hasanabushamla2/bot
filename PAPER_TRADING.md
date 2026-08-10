@@ -94,10 +94,12 @@ Before enabling live trading:
 1. Run paper trading for a statistically significant period (weeks, not hours).
 2. Verify strategy performance aligns with backtest results.
 3. Verify fill rates, slippage estimates, and fee calculations.
-4. Complete the security checklist in SECURITY.md.
-5. Set `MODE=live` AND `LIVE_TRADING_ENABLED=true`.
-6. Start with minimal position sizes.
-7. Monitor closely for the first 24 hours.
+4. Validate `STRATEGY_CAPACITY` reports from the Capacity Estimator against observed paper fills.
+5. Confirm the Capital Allocator is properly distributing across opportunities as equity grows.
+6. Complete the security checklist in SECURITY.md.
+7. Set `MODE=live` AND `LIVE_TRADING_ENABLED=true`.
+8. Start with minimal position sizes.
+9. Monitor closely for the first 24 hours.
 
 ---
 

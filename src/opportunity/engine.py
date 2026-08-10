@@ -37,6 +37,12 @@ class OpportunityScore:
     strategy_expectancy_bonus: float = 0.0
     final_score: float = 0.0
 
+    # Capacity-aware fields (populated by Portfolio subsystem)
+    market_impact_bps: float = 0.0
+    max_efficient_size: float = 0.0
+    capacity_utilization: float = 0.0  # 0.0 to 1.0
+    diversification_score: float = 1.0
+
 
 @dataclass
 class EvaluatedOpportunity:
@@ -51,6 +57,11 @@ class EvaluatedOpportunity:
     # Opportunity metadata
     available_liquidity: float | None = None
     correlation_with_positions: float = 0.0
+
+    # Position capacity (populated by CapacityEstimator)
+    max_efficient_capital: float = 0.0
+    expected_fill_pct: float = 100.0
+    expected_market_impact_bps: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -107,8 +118,11 @@ class OpportunityEngine:
         if signal.confidence < self.min_confidence:
             opp.status = OpportunityStatus.REJECTED
             opp.rejection_reason = RejectionReason.OTHER
-            logger.debug("opportunity_rejected_low_confidence",
-                         strategy=signal.strategy_id, confidence=signal.confidence)
+            logger.debug(
+                "opportunity_rejected_low_confidence",
+                strategy=signal.strategy_id,
+                confidence=signal.confidence,
+            )
             return opp
 
         # --- Stage 2: Compute expected net return ---

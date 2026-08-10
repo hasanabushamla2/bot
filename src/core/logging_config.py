@@ -16,8 +16,14 @@ import structlog
 def _secrets_filter(_logger: Any, _method: Any, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Remove any key that looks like a secret from log output."""
     secret_keys = {
-        "api_key", "api_secret", "secret", "password", "token",
-        "private_key", "passphrase", "credential",
+        "api_key",
+        "api_secret",
+        "secret",
+        "password",
+        "token",
+        "private_key",
+        "passphrase",
+        "credential",
     }
     for key in list(event_dict):
         key_lower = key.lower()
