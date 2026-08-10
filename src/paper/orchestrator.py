@@ -64,7 +64,7 @@ class PaperTradingOrchestrator:
         self.quality_filter = AssetQualityFilter(QualityFilterConfig())
         self.scanner = GlobalScanner()
         self.registry = StrategyRegistry()
-        self.opportunity_engine = OpportunityEngine()
+        self.opportunity_engine = OpportunityEngine(min_net_return=0.001)
         self.risk_engine = RiskEngine()
         self.tier_manager = CapitalTierManager(CapitalTierConfig())
         self.allocator = CapitalAllocator(AllocatorConfig())

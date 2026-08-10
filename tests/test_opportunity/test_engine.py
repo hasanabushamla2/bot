@@ -56,7 +56,7 @@ class TestOpportunityEvaluation:
         assert opp.status.value == "rejected"
 
     def test_net_return_below_minimum_rejected(self) -> None:
-        engine = OpportunityEngine(min_net_return_pct=1.0)
+        engine = OpportunityEngine(min_net_return=1.0)
         signal = make_signal(estimated_return=0.1)  # 0.1% gross, less after fees
         opp = engine.evaluate(signal)
         assert opp.status.value == "rejected"
