@@ -1,13 +1,26 @@
-"""Altcoin Opportunity Scanner — continuous multi-asset signal detection.
+"""Global Multi-Asset Opportunity Scanner — continuous, asset-class-agnostic
+signal detection across ALL supported markets and instruments.
 
-Scans 100+ altcoin spot pairs simultaneously, detecting early movement
-signals before they become obvious. Produces ranked opportunity signals
-for the Opportunity Engine.
+PRINCIPLE:
+    Scan everything that is legitimately accessible →
+    normalize all opportunities →
+    compare them →
+    allocate capital to the best qualified opportunities.
 
-SCANNED SIGNALS:
+SUPPORTED ASSET CLASSES (modular, extensible):
+- Crypto Spot: BTC, ETH, liquid altcoins, stablecoin pairs
+- Gold / Gold-linked: XAU/USD and instruments where a legitimate API exists
+- FX Spot: Major and minor currency pairs where supported
+- Additional liquid instruments via adapter plugins
+
+The scanner has NO loyalty to any specific asset, asset class, or
+instrument. An opportunity is an opportunity — ranked purely by
+quantitative merit.
+
+SCANNED SIGNALS (universal, applicable across all asset classes):
 - Volume Spikes: current volume vs. historical average
-- Relative Volume: volume relative to peers
-- Momentum Acceleration: rate-of-change of momentum
+- Relative Volume: volume relative to universe peers
+- Momentum Acceleration: rate-of-change of price momentum
 - Price Acceleration: second derivative of price
 - Breakouts: price exceeding recent range with volume confirmation
 - Order-Book Imbalance: bid/ask ratio asymmetry
@@ -16,8 +29,7 @@ SCANNED SIGNALS:
 - Spread Changes: tightening/widening spreads
 - Volatility Expansion: sudden increase in price range
 
-SAFETY FILTER:
-Before any altcoin becomes tradable, the scanner checks:
+SAFETY FILTER (applied before any instrument enters ranking):
 - Sufficient order-book depth
 - Acceptable spread
 - Sufficient 24h volume
@@ -25,12 +37,20 @@ Before any altcoin becomes tradable, the scanner checks:
 - Healthy market-data feed
 - Valid instrument metadata
 - Active trading status
+- Adequate execution capacity
+
+INTEGRATION:
+Scanner → AssetSnapshots → GlobalScanner.scan() → ScannerSignals →
+  to_strategy_signal() → OpportunityEngine → RiskEngine →
+  CapitalAllocator → ExecutionEngine
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import Enum
+from typing import Any
 
 from src.core.logging_config import get_logger
 from src.portfolio.universe import UniverseManager
@@ -40,33 +60,62 @@ logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Asset class enumeration — modular, extensible
+# ---------------------------------------------------------------------------
+
+
+class AssetClass(str, Enum):
+    """Supported asset classes. Add new entries as new adapters are built.
+
+    The scanner treats all classes uniformly. This enum exists purely
+    for metadata tagging and universe filtering — never for bias.
+    """
+
+    CRYPTO_SPOT = "crypto_spot"
+    GOLD = "gold"
+    FX_SPOT = "fx_spot"
+    # Future: EQUITY, BOND, COMMODITY, INDEX
+
+
+# ---------------------------------------------------------------------------
 # Scanner configuration
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class AltcoinScannerConfig:
-    """Configuration for the altcoin opportunity scanner."""
+class ScannerConfig:
+    """Configuration for the global multi-asset opportunity scanner.
 
-    # Safety filters
-    min_volume_24h_usd: float = 1_000_000.0  # Minimum $ volume
-    max_spread_pct: float = 5.0  # Maximum bid/ask spread %
-    min_order_book_depth_usd: float = 10_000.0  # Minimum depth at 10bps
-    max_estimated_slippage_pct: float = 1.0  # Max slippage for $1k order
+    Safety thresholds are asset-class-agnostic. Per-asset-class
+    overrides are supported via the `per_class` dict for cases
+    where e.g. FX has much tighter spreads than crypto.
+    """
+
+    # Safety filters (global defaults)
+    min_volume_24h_usd: float = 1_000_000.0
+    max_spread_pct: float = 5.0
+    min_order_book_depth_usd: float = 10_000.0
+    max_estimated_slippage_pct: float = 1.0
+
+    # Per-asset-class overrides (optional)
+    per_class: dict[AssetClass, dict[str, float]] = field(default_factory=dict)
 
     # Signal thresholds
-    volume_spike_threshold: float = 2.0  # Multiple of average volume
-    momentum_accel_threshold: float = 0.05  # Rate-of-change threshold
-    breakout_stddev: float = 2.0  # Standard deviations for breakout
-    order_imbalance_threshold: float = 0.3  # Bid/ask ratio deviation
+    volume_spike_threshold: float = 2.0
+    momentum_accel_threshold: float = 0.05
+    breakout_stddev: float = 2.0
+    order_imbalance_threshold: float = 0.3
 
     # Scanner capacity
-    max_scanned_assets: int = 150  # Maximum concurrent scans
-    scan_interval_seconds: float = 1.0  # How often to re-scan
+    max_scanned_assets: int = 200  # BTC + ETH + 100+ altcoins + gold + FX
+    scan_interval_seconds: float = 1.0
 
     # Output
-    min_signal_confidence: float = 0.3  # Minimum confidence to emit
-    max_signals_per_scan: int = 20  # Cap signals per scan cycle
+    min_signal_confidence: float = 0.3
+    max_signals_per_scan: int = 30
+
+    # Asset class activation — which classes to scan
+    enabled_classes: list[AssetClass] = field(default_factory=lambda: [AssetClass.CRYPTO_SPOT])
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +125,15 @@ class AltcoinScannerConfig:
 
 @dataclass
 class AssetSnapshot:
-    """Market snapshot for a single altcoin at one point in time."""
+    """Market snapshot for one instrument at one point in time.
+
+    Asset-class agnostic. BTC, ETH, an altcoin, gold, or EUR/USD —
+    all produce the same snapshot structure.
+    """
 
     symbol: str
     exchange: str
+    asset_class: AssetClass = AssetClass.CRYPTO_SPOT
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     # Price
@@ -89,6 +143,7 @@ class AssetSnapshot:
     spread_pct: float = 0.0
     price_change_1m_pct: float = 0.0
     price_change_5m_pct: float = 0.0
+    price_change_1h_pct: float = 0.0
 
     # Volume
     volume_24h: float = 0.0
@@ -101,7 +156,7 @@ class AssetSnapshot:
     depth_ask_10bps: float = 0.0
     bid_ask_ratio: float = 1.0
 
-    # Derived
+    # Derived (computed during scan)
     momentum_score: float = 0.0
     breakout_score: float = 0.0
     volume_score: float = 0.0
@@ -112,10 +167,18 @@ class AssetSnapshot:
     passes_safety_filter: bool = False
     safety_rejection_reason: str = ""
 
+    # Instrument metadata
+    metadata: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
-class AltcoinSignal:
-    """A detected altcoin opportunity with all scoring factors."""
+class ScannerSignal:
+    """A detected opportunity from ANY asset class with all scoring factors.
+
+    BTC, Altcoin, Gold, FX — all produce the same signal type.
+    The Opportunity Engine and Capital Allocator compare them
+    purely on quantitative merit.
+    """
 
     snapshot: AssetSnapshot
 
@@ -137,70 +200,86 @@ class AltcoinSignal:
 
 
 # ---------------------------------------------------------------------------
-# Scanner
+# Global Scanner
 # ---------------------------------------------------------------------------
 
 
-class AltcoinScanner:
-    """Continuously scans 100+ altcoin spot pairs for trading opportunities.
+class GlobalScanner:
+    """Continuously scans ALL supported markets for trading opportunities.
+
+    BLUEPRINT:
+    SCAN EVERYTHING THAT IS LEGITIMATELY ACCESSIBLE →
+    NORMALIZE ALL OPPORTUNITIES →
+    COMPARE THEM →
+    ALLOCATE CAPITAL TO THE BEST QUALIFIED OPPORTUNITIES
 
     The scanner does NOT decide what to trade — it produces ranked signals.
     The Opportunity Engine, Risk Engine, and Capital Allocator make the
     final decision.
 
-    Design: lightweight, runs every scan_interval_seconds, produces at most
-    max_signals_per_scan signals.
+    Asset loyalty: NONE.
+    If BTC is stagnant → ignore it.
+    If an altcoin produces a stronger signal → allocate there.
+    If gold produces the strongest opportunity → allocate there.
     """
 
     def __init__(
         self,
-        config: AltcoinScannerConfig | None = None,
+        config: ScannerConfig | None = None,
         universe: UniverseManager | None = None,
     ) -> None:
-        self.config = config or AltcoinScannerConfig()
+        self.config = config or ScannerConfig()
         self._universe = universe
 
         # Rolling data for signal computation
-        self._price_history: dict[str, list[float]] = {}  # symbol → [prices]
-        self._volume_history: dict[str, list[float]] = {}  # symbol → [volumes]
+        self._price_history: dict[str, list[float]] = {}
+        self._volume_history: dict[str, list[float]] = {}
         self._max_history: int = 100
 
     # ------------------------------------------------------------------
     # Main scan entry point
     # ------------------------------------------------------------------
 
-    def scan(
-        self,
-        snapshots: list[AssetSnapshot],
-    ) -> list[AltcoinSignal]:
-        """Scan a batch of asset snapshots and produce ranked signals.
+    def scan(self, snapshots: list[AssetSnapshot]) -> list[ScannerSignal]:
+        """Scan a batch of asset snapshots from ALL asset classes.
 
         Args:
-            snapshots: Current market snapshots for all scanned assets.
+            snapshots: Current market snapshots for all scanned assets
+                       across all enabled asset classes.
 
         Returns:
-            Ranked list of AltcoinSignals, best first.
+            Ranked list of ScannerSignals (best first), capped at
+            max_signals_per_scan.
         """
         # --- Update rolling history ---
         for snap in snapshots:
             self._update_history(snap)
 
+        # --- Filter by enabled asset classes ---
+        enabled = {ac.value for ac in self.config.enabled_classes}
+        class_filtered = [s for s in snapshots if s.asset_class.value in enabled]
+
         # --- Safety filter ---
-        eligible = [s for s in snapshots if self._check_safety(s)]
-        for s in snapshots:
-            if not s.passes_safety_filter:
+        eligible: list[AssetSnapshot] = []
+        for s in class_filtered:
+            if self._check_safety(s):
+                eligible.append(s)
+            else:
                 logger.debug(
-                    "altcoin_safety_rejected", symbol=s.symbol, reason=s.safety_rejection_reason
+                    "scanner_safety_rejected",
+                    symbol=s.symbol,
+                    asset_class=s.asset_class.value,
+                    reason=s.safety_rejection_reason,
                 )
 
         # --- Compute scores ---
-        signals: list[AltcoinSignal] = []
+        signals: list[ScannerSignal] = []
         for snap in eligible:
             signal = self._compute_scores(snap)
             if signal.confidence >= self.config.min_signal_confidence:
                 signals.append(signal)
 
-        # --- Rank by composite score ---
+        # --- Rank by composite score (asset-class agnostic) ---
         signals.sort(key=lambda s: s.composite_score, reverse=True)
 
         # --- Cap ---
@@ -211,18 +290,26 @@ class AltcoinScanner:
     # ------------------------------------------------------------------
 
     def _check_safety(self, snap: AssetSnapshot) -> bool:
-        """Run all safety checks on an asset. Sets passes_safety_filter."""
+        """Asset-class-agnostic safety filter.
+
+        Uses global defaults unless per-class overrides exist.
+        """
         cfg = self.config
 
-        if snap.volume_24h < cfg.min_volume_24h_usd:
-            snap.safety_rejection_reason = (
-                f"Volume ${snap.volume_24h:,.0f} < ${cfg.min_volume_24h_usd:,.0f}"
-            )
+        # Per-class overrides
+        overrides = cfg.per_class.get(snap.asset_class, {})
+
+        vol_min = overrides.get("min_volume_24h_usd", cfg.min_volume_24h_usd)
+        spread_max = overrides.get("max_spread_pct", cfg.max_spread_pct)
+        depth_min = overrides.get("min_order_book_depth_usd", cfg.min_order_book_depth_usd)
+
+        if snap.volume_24h < vol_min:
+            snap.safety_rejection_reason = f"Volume ${snap.volume_24h:,.0f} < ${vol_min:,.0f}"
             snap.passes_safety_filter = False
             return False
 
-        if snap.spread_pct > cfg.max_spread_pct:
-            snap.safety_rejection_reason = f"Spread {snap.spread_pct:.2f}% > {cfg.max_spread_pct}%"
+        if snap.spread_pct > spread_max:
+            snap.safety_rejection_reason = f"Spread {snap.spread_pct:.2f}% > {spread_max}%"
             snap.passes_safety_filter = False
             return False
 
@@ -236,11 +323,7 @@ class AltcoinScanner:
             snap.passes_safety_filter = False
             return False
 
-        # Depth check (if data available)
-        if (
-            snap.depth_bid_10bps > 0
-            and snap.depth_bid_10bps * snap.bid < cfg.min_order_book_depth_usd
-        ):
+        if snap.depth_bid_10bps > 0 and snap.depth_bid_10bps * snap.bid < depth_min:
             snap.safety_rejection_reason = "Insufficient order-book depth"
             snap.passes_safety_filter = False
             return False
@@ -252,27 +335,21 @@ class AltcoinScanner:
     # Signal scoring
     # ------------------------------------------------------------------
 
-    def _compute_scores(self, snap: AssetSnapshot) -> AltcoinSignal:
-        """Compute all component scores for one asset."""
-        signal = AltcoinSignal(snapshot=snap)
+    def _compute_scores(self, snap: AssetSnapshot) -> ScannerSignal:
+        """Compute all component scores for one asset.
 
-        # 1. Momentum score — price acceleration
+        Asset-class agnostic. A BTC snapshot and a gold snapshot
+        flow through the exact same scoring pipeline.
+        """
+        signal = ScannerSignal(snapshot=snap)
+
         signal.momentum_score = self._score_momentum(snap)
-
-        # 2. Volume score — volume spike detection
         signal.volume_score = self._score_volume(snap)
-
-        # 3. Breakout score — range breakout with volume confirmation
         signal.breakout_score = self._score_breakout(snap)
-
-        # 4. Flow score — order-book imbalance
         signal.flow_score = self._score_flow(snap)
-
-        # 5. Liquidity score — tight spread, deep book
         signal.liquidity_score = self._score_liquidity(snap)
 
-        # --- Composite (weighted) ---
-        # Momentum: 25%, Volume: 25%, Breakout: 20%, Flow: 15%, Liquidity: 15%
+        # Composite: momentum 25%, volume 25%, breakout 20%, flow 15%, liquidity 15%
         signal.composite_score = (
             signal.momentum_score * 0.25
             + signal.volume_score * 0.25
@@ -281,13 +358,9 @@ class AltcoinScanner:
             + signal.liquidity_score * 0.15
         )
 
-        # --- Confidence: composite moderated by liquidity ---
         signal.confidence = signal.composite_score * (0.5 + 0.5 * signal.liquidity_score)
+        signal.estimated_net_edge_bps = signal.composite_score * 50.0
 
-        # --- Estimated net edge (simplified) ---
-        signal.estimated_net_edge_bps = signal.composite_score * 50.0  # Up to ~50bps
-
-        # --- Rank reason ---
         reasons = []
         if signal.momentum_score > 0.7:
             reasons.append("momentum")
@@ -302,99 +375,53 @@ class AltcoinScanner:
         return signal
 
     # ------------------------------------------------------------------
-    # Individual scorers
+    # Individual scorers (asset-class agnostic)
     # ------------------------------------------------------------------
 
     def _score_momentum(self, snap: AssetSnapshot) -> float:
-        """Score price momentum/acceleration.
-
-        Combines short-term (1m) and medium-term (5m) price changes.
-        Higher absolute change + consistency → higher score.
-        """
         scores: list[float] = []
 
-        # 1-minute momentum
         if abs(snap.price_change_1m_pct) > 0:
-            m1 = min(1.0, abs(snap.price_change_1m_pct) / 2.0)  # 2% → 1.0
-            scores.append(m1)
-
-        # 5-minute momentum
+            scores.append(min(1.0, abs(snap.price_change_1m_pct) / 2.0))
         if abs(snap.price_change_5m_pct) > 0:
-            m5 = min(1.0, abs(snap.price_change_5m_pct) / 5.0)  # 5% → 1.0
-            scores.append(m5)
+            scores.append(min(1.0, abs(snap.price_change_5m_pct) / 5.0))
 
-        # Acceleration from rolling data
         hist = self._price_history.get(snap.symbol, [])
-        if len(hist) >= 5:
-            recent = hist[-5:]
-            if recent[0] > 0:
-                accel = (recent[-1] - recent[0]) / recent[0] * 100.0
-                accel_score = min(1.0, abs(accel) / 3.0)
-                scores.append(accel_score)
+        if len(hist) >= 5 and hist[0] > 0:
+            accel = (hist[-1] - hist[0]) / hist[0] * 100.0
+            scores.append(min(1.0, abs(accel) / 3.0))
 
         if not scores:
             return 0.0
         return sum(scores) / len(scores)
 
     def _score_volume(self, snap: AssetSnapshot) -> float:
-        """Score volume spike vs. historical average."""
         if snap.volume_vs_avg_ratio <= 0:
             return 0.0
-
-        cfg = self.config
-        if snap.volume_vs_avg_ratio >= cfg.volume_spike_threshold:
-            # Above threshold: map to 0.5-1.0
-            return min(1.0, 0.5 + (snap.volume_vs_avg_ratio - cfg.volume_spike_threshold) / 5.0)
-
-        # Below threshold: map to 0-0.5
-        return snap.volume_vs_avg_ratio / cfg.volume_spike_threshold * 0.5
+        t = self.config.volume_spike_threshold
+        if snap.volume_vs_avg_ratio >= t:
+            return min(1.0, 0.5 + (snap.volume_vs_avg_ratio - t) / 5.0)
+        return snap.volume_vs_avg_ratio / t * 0.5
 
     def _score_breakout(self, snap: AssetSnapshot) -> float:
-        """Score for range breakout detection.
-
-        A breakout occurs when price moves beyond recent range on
-        elevated volume. Simple check: is price_change_1m significant
-        and volume elevated?
-        """
         score = 0.0
-
-        # Price movement component
         move = abs(snap.price_change_1m_pct)
-        if move > 0.5:  # 0.5% in 1 minute is notable
+        if move > 0.5:
             score += min(1.0, move / 3.0) * 0.5
-
-        # Volume confirmation component
         if snap.volume_vs_avg_ratio > 1.5:
             score += min(1.0, (snap.volume_vs_avg_ratio - 1.0) / 3.0) * 0.5
-
         return min(1.0, score)
 
     def _score_flow(self, snap: AssetSnapshot) -> float:
-        """Score order-book imbalance.
-
-        bid_ask_ratio > 1 → more bid depth (buy pressure)
-        bid_ask_ratio < 1 → more ask depth (sell pressure)
-        """
         if snap.bid_ask_ratio <= 0:
             return 0.0
-
-        # Deviation from 1.0 (balanced)
-        deviation = abs(snap.bid_ask_ratio - 1.0)
-        return min(1.0, deviation / 0.5)  # 0.5 deviation → 1.0
+        return min(1.0, abs(snap.bid_ask_ratio - 1.0) / 0.5)
 
     def _score_liquidity(self, snap: AssetSnapshot) -> float:
-        """Score based on execution quality: spread, depth, volume."""
         scores: list[float] = []
-
-        # Spread: lower is better. 0% → 1.0, 5% → 0.0
-        spread_score = max(0.0, 1.0 - snap.spread_pct / 5.0)
-        scores.append(spread_score)
-
-        # Volume: log scale
+        scores.append(max(0.0, 1.0 - snap.spread_pct / 5.0))
         if snap.volume_24h > 0:
-            vol_score = min(1.0, snap.volume_24h / 50_000_000.0)
-            scores.append(vol_score)
-
+            scores.append(min(1.0, snap.volume_24h / 50_000_000.0))
         if not scores:
             return 0.0
         return sum(scores) / len(scores)
@@ -404,7 +431,6 @@ class AltcoinScanner:
     # ------------------------------------------------------------------
 
     def _update_history(self, snap: AssetSnapshot) -> None:
-        """Update rolling price and volume history."""
         if snap.last_price > 0:
             hist = self._price_history.setdefault(snap.symbol, [])
             hist.append(snap.last_price)
@@ -418,17 +444,17 @@ class AltcoinScanner:
                 self._volume_history[snap.symbol] = vhist[-self._max_history :]
 
     # ------------------------------------------------------------------
-    # Convert to StrategySignal
+    # Convert to StrategySignal (bridge to the pipeline)
     # ------------------------------------------------------------------
 
-    def to_strategy_signal(self, alt_signal: AltcoinSignal) -> StrategySignal:
-        """Convert an AltcoinSignal to the standard StrategySignal format.
+    def to_strategy_signal(self, scanner_signal: ScannerSignal) -> StrategySignal:
+        """Convert a ScannerSignal (from any asset class) to the standard
+        StrategySignal format consumed by the Opportunity Engine.
 
-        This bridges the scanner output into the existing opportunity pipeline.
+        Assets are tagged with their class but ranked purely by signal quality.
         """
-        snap = alt_signal.snapshot
+        snap = scanner_signal.snapshot
 
-        # Determine direction from momentum
         if snap.price_change_1m_pct > 0:
             direction = SignalDirection.LONG
         elif snap.price_change_1m_pct < 0:
@@ -437,23 +463,24 @@ class AltcoinScanner:
             direction = SignalDirection.NEUTRAL
 
         return StrategySignal(
-            strategy_id="altcoin_scanner",
+            strategy_id="global_scanner",
             strategy_version="1.0.0",
             exchange=snap.exchange,
             symbol=snap.symbol,
-            market="crypto_spot",
+            market=snap.asset_class.value,
             direction=direction,
-            confidence=alt_signal.confidence,
-            estimated_return=snap.price_change_5m_pct,  # Recent momentum proxy
+            confidence=scanner_signal.confidence,
+            estimated_return=snap.price_change_5m_pct,
             estimated_risk=abs(snap.price_change_5m_pct) * 0.5,
-            required_capital=None,  # Allocator determines size
+            required_capital=None,
             entry_logic={
-                "scanner": "altcoin_scanner",
-                "momentum_score": alt_signal.momentum_score,
-                "volume_score": alt_signal.volume_score,
-                "breakout_score": alt_signal.breakout_score,
-                "flow_score": alt_signal.flow_score,
-                "composite_score": alt_signal.composite_score,
+                "scanner": "global_scanner",
+                "asset_class": snap.asset_class.value,
+                "momentum_score": scanner_signal.momentum_score,
+                "volume_score": scanner_signal.volume_score,
+                "breakout_score": scanner_signal.breakout_score,
+                "flow_score": scanner_signal.flow_score,
+                "composite_score": scanner_signal.composite_score,
             },
             exit_logic={
                 "hard_stop_pct": 0.30,
@@ -462,6 +489,7 @@ class AltcoinScanner:
                 "no_fixed_take_profit": True,
             },
             metadata={
+                "asset_class": snap.asset_class.value,
                 "volume_24h": snap.volume_24h,
                 "spread_pct": snap.spread_pct,
                 "bid_ask_ratio": snap.bid_ask_ratio,
@@ -469,10 +497,11 @@ class AltcoinScanner:
                 "price_change_1m": snap.price_change_1m_pct,
                 "price_change_5m": snap.price_change_5m_pct,
                 "stop_loss_pct": 0.30,
+                "exchange": snap.exchange,
             },
-            signal_expires_at=datetime.now(UTC) + timedelta(seconds=30),  # 30s expiry
+            signal_expires_at=datetime.now(UTC) + timedelta(seconds=30),
         )
 
-    def to_strategy_signals(self, alt_signals: list[AltcoinSignal]) -> list[StrategySignal]:
-        """Batch-convert altcoin signals to strategy signals."""
-        return [self.to_strategy_signal(s) for s in alt_signals]
+    def to_strategy_signals(self, scanner_signals: list[ScannerSignal]) -> list[StrategySignal]:
+        """Batch-convert signals to strategy signals."""
+        return [self.to_strategy_signal(s) for s in scanner_signals]

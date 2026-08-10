@@ -5,7 +5,7 @@ FINAL POLICY (v1.0):
 - HARD STOP: -0.30% per position
 - NO FIXED TAKE PROFIT
 - TRAILING STOP for profit protection
-- 100+ altcoin universe
+- Global multi-asset universe (crypto, gold, FX — all eligible)
 - Opportunity-driven trade count
 - Dynamic capital allocation
 
