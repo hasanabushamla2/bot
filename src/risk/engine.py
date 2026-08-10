@@ -196,13 +196,13 @@ class RiskEngine:
 
         # --- Gate 8: Stop Loss ---
         signal = opportunity.signal
-        stop_loss_pct = signal.metadata.get("stop_loss_pct", self.default_stop_loss_pct)
+        stop_loss_pct: float = float(signal.metadata.get("stop_loss_pct", self.default_stop_loss_pct))
         assessment.stop_loss_price = self._compute_stop_loss(signal, stop_loss_pct)
 
         # --- Gate 9: Take Profit ---
-        take_profit_pct = signal.metadata.get("take_profit_pct", None)
-        if take_profit_pct:
-            assessment.take_profit_price = self._compute_take_profit(signal, take_profit_pct)
+        take_profit_pct_raw = signal.metadata.get("take_profit_pct", None)
+        if take_profit_pct_raw is not None:
+            assessment.take_profit_price = self._compute_take_profit(signal, float(take_profit_pct_raw))
 
         # --- PASSED ---
         assessment.decision = RiskDecision.APPROVED
@@ -279,9 +279,10 @@ class RiskEngine:
         self, signal: StrategySignal, stop_loss_pct: float
     ) -> float | None:
         """Compute stop loss price based on signal direction and percentage."""
-        ticker_price = signal.metadata.get("entry_price")
-        if ticker_price is None:
+        ticker_price_raw = signal.metadata.get("entry_price")
+        if ticker_price_raw is None:
             return None
+        ticker_price = float(ticker_price_raw)
         pct = stop_loss_pct / 100.0
         if signal.direction.value == "long":
             return ticker_price * (1 - pct)
@@ -292,9 +293,10 @@ class RiskEngine:
         self, signal: StrategySignal, take_profit_pct: float
     ) -> float | None:
         """Compute take profit price."""
-        ticker_price = signal.metadata.get("entry_price")
-        if ticker_price is None:
+        ticker_price_raw = signal.metadata.get("entry_price")
+        if ticker_price_raw is None:
             return None
+        ticker_price = float(ticker_price_raw)
         pct = take_profit_pct / 100.0
         if signal.direction.value == "long":
             return ticker_price * (1 + pct)
@@ -302,5 +304,4 @@ class RiskEngine:
             return ticker_price * (1 - pct)
 
 
-# Need this import for type hint (avoid circular)
 from src.strategies.base import StrategySignal

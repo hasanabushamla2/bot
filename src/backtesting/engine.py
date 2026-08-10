@@ -377,14 +377,14 @@ class BacktestEngine:
         result.max_drawdown_pct = self._max_drawdown(equity_curve)
         result.sharpe_ratio = self._sharpe_ratio(equity_curve)
         result.sortino_ratio = self._sortino_ratio(equity_curve)
-        result.avg_trade_return_pct = np.mean([t.return_pct for t in trades]) if trades else 0.0
+        result.avg_trade_return_pct = float(np.mean([t.return_pct for t in trades])) if trades else 0.0
         result.avg_win_pct = (
-            np.mean([t.return_pct for t in trades if t.net_pnl > 0])
+            float(np.mean([t.return_pct for t in trades if t.net_pnl > 0]))
             if result.winning_trades > 0
             else 0.0
         )
         result.avg_loss_pct = (
-            np.mean([t.return_pct for t in trades if t.net_pnl <= 0])
+            float(np.mean([t.return_pct for t in trades if t.net_pnl <= 0]))
             if result.losing_trades > 0
             else 0.0
         )

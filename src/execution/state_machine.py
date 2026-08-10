@@ -10,20 +10,10 @@ This is the single source of truth for what transitions are legal.
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import ClassVar
 
+from src.adapters.base import OrderState
 from src.core.exceptions import ExecutionError
-
-
-class OrderState(str, Enum):
-    PENDING = "pending"              # Created, not yet sent
-    OPEN = "open"                    # Sent, acknowledged, resting on book
-    PARTIALLY_FILLED = "partially_filled"  # Some quantity filled
-    FILLED = "filled"                # All quantity filled
-    CANCELED = "canceled"            # Canceled by user or system
-    REJECTED = "rejected"            # Rejected by exchange
-    EXPIRED = "expired"              # Time-in-force expired
 
 
 class OrderStateMachine:

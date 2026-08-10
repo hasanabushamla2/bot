@@ -198,12 +198,12 @@ class OpportunityEngine:
         """Estimate round-trip fees as percentage of trade value."""
         # Default: 0.1% taker fee each way = 0.2% round trip
         # Override with exchange-specific fee data when available
-        taker_fee = signal.metadata.get("taker_fee", 0.001)
+        taker_fee = float(signal.metadata.get("taker_fee", 0.001))
         return taker_fee * 2  # entry + exit
 
     def _estimate_spread(self, signal: StrategySignal) -> float:
         """Estimate spread cost as percentage."""
-        return signal.metadata.get("spread_pct", 0.0005)  # default 5 bps
+        return float(signal.metadata.get("spread_pct", 0.0005))  # default 5 bps
 
     def _estimate_slippage(self, signal: StrategySignal) -> float:
         """Estimate slippage as percentage of trade value."""

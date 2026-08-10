@@ -212,14 +212,14 @@ class AnalyticsTracker:
         m.max_drawdown_pct = self._max_drawdown_pct
 
         # Expectancy
-        m.avg_win = np.mean(self._win_returns) if self._win_returns else 0.0
-        m.avg_loss = np.mean(self._loss_returns) if self._loss_returns else 0.0
+        m.avg_win = float(np.mean(self._win_returns)) if self._win_returns else 0.0
+        m.avg_loss = float(np.mean(self._loss_returns)) if self._loss_returns else 0.0
         m.expectancy = (
             (m.win_rate * m.avg_win) - ((1 - m.win_rate) * abs(m.avg_loss))
             if m.total_trades > 0
             else 0.0
         )
-        m.avg_trade_return_pct = np.mean(self._trade_returns) if self._trade_returns else 0.0
+        m.avg_trade_return_pct = float(np.mean(self._trade_returns)) if self._trade_returns else 0.0
 
         # Sharpe / Sortino (from daily returns)
         daily_vals = list(self._daily_pnl.values())

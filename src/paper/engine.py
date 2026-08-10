@@ -23,10 +23,10 @@ from src.adapters.base import (
     NormalizedOrderRequest,
     NormalizedTicker,
     OrderSide,
+    OrderState,
     OrderType,
 )
 from src.core.logging_config import get_logger
-from src.execution.state_machine import OrderState
 
 logger = get_logger(__name__)
 
@@ -132,7 +132,7 @@ class PaperExecutionEngine:
             exchange_order_id=f"paper_{request.client_order_id[:12]}",
             side=request.side,
             order_type=request.order_type,
-            state=OrderState.FILLED,  # type: ignore[assignment]
+            state=OrderState.FILLED,
             quantity=request.quantity,
             filled_quantity=request.quantity,
             filled_avg_price=fill_price,
@@ -174,7 +174,7 @@ class PaperExecutionEngine:
             exchange_order_id=f"paper_{request.client_order_id[:12]}",
             side=request.side,
             order_type=request.order_type,
-            state=OrderState.OPEN,  # type: ignore[assignment]
+            state=OrderState.OPEN,
             quantity=request.quantity,
             filled_quantity=0.0,
             filled_avg_price=None,
@@ -197,7 +197,7 @@ class PaperExecutionEngine:
             exchange_order_id=None,
             side=request.side,
             order_type=request.order_type,
-            state=OrderState.REJECTED,  # type: ignore[assignment]
+            state=OrderState.REJECTED,
             quantity=request.quantity,
             filled_quantity=0.0,
             filled_avg_price=None,

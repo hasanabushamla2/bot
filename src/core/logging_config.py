@@ -70,4 +70,5 @@ def setup_logging(level: str = "INFO", fmt: str = "json") -> None:
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Get a structured logger for the given component name."""
-    return structlog.get_logger(name)
+    logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)
+    return logger

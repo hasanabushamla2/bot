@@ -112,11 +112,12 @@ class BaseStrategy(ABC):
     @property
     def strategy_version(self) -> str:
         """Semantic version of the strategy."""
-        return self.config.get("version", "1.0.0")
+        v = self.config.get("version", "1.0.0")
+        return str(v)
 
     @property
     def is_enabled(self) -> bool:
-        return self._enabled
+        return bool(self._enabled)
 
     def enable(self) -> None:
         self._enabled = True

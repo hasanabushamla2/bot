@@ -129,13 +129,7 @@ exclude = [
     "dist/",
 ]
 
-[[tool.mypy.overrides]]
-module = [
-    "redis.*",
-    "orjson.*",
-    "pyarrow.*",
-]
-ignore_missing_imports = true
+
 
 [tool.pytest.ini_options]
 minversion = "7.0"
