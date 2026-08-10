@@ -120,7 +120,7 @@ class RealTimeDataEngine:
 
         while True:
             try:
-                async for ticker in adapter.subscribe_ticker(symbol):  # type: ignore[attr-defined]
+                async for ticker in adapter.subscribe_ticker(symbol):
                     self._record_message(stream_key)
                     yield ticker
             except Exception as e:
@@ -155,7 +155,7 @@ class RealTimeDataEngine:
 
         while True:
             try:
-                async for book in adapter.subscribe_order_book(symbol):  # type: ignore[attr-defined]
+                async for book in adapter.subscribe_order_book(symbol):
                     self._record_message(stream_key)
                     self._order_books[f"{exchange_name}:{symbol}"] = book
                     yield book
@@ -190,7 +190,7 @@ class RealTimeDataEngine:
 
         while True:
             try:
-                async for trade in adapter.subscribe_trades(symbol):  # type: ignore[attr-defined]
+                async for trade in adapter.subscribe_trades(symbol):
                     self._record_message(stream_key)
                     yield trade
             except Exception as e:

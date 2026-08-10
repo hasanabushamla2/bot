@@ -228,17 +228,17 @@ class ExchangeAdapter(ABC):
         ...
 
     @abstractmethod
-    async def subscribe_ticker(self, symbol: str) -> AsyncIterator[NormalizedTicker]:
+    def subscribe_ticker(self, symbol: str) -> AsyncIterator[NormalizedTicker]:
         """Subscribe to real-time ticker updates via WebSocket."""
         ...
 
     @abstractmethod
-    async def subscribe_order_book(self, symbol: str) -> AsyncIterator[NormalizedOrderBook]:
+    def subscribe_order_book(self, symbol: str) -> AsyncIterator[NormalizedOrderBook]:
         """Subscribe to real-time order book updates via WebSocket."""
         ...
 
     @abstractmethod
-    async def subscribe_trades(self, symbol: str) -> AsyncIterator[NormalizedTrade]:
+    def subscribe_trades(self, symbol: str) -> AsyncIterator[NormalizedTrade]:
         """Subscribe to real-time trade stream via WebSocket."""
         ...
 
