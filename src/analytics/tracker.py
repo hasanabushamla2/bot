@@ -9,6 +9,7 @@ All metrics are computed from actual trade data — never fabricated.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -101,14 +102,14 @@ class AnalyticsTracker:
     """
 
     def __init__(self) -> None:
-        self._daily_pnl: dict[str, float] = {}  # date -> net_pnl
-        self._daily_returns: dict[str, float] = {}  # date -> return_pct
-        self._equity_history: list[tuple[datetime, float]] = []
-        self._trade_returns: list[float] = []
-        self._win_returns: list[float] = []
-        self._loss_returns: list[float] = []
-        self._execution_latencies: list[float] = []
-        self._signal_to_order_latencies: list[float] = []
+        self._daily_pnl: dict[str, float] = {}
+        self._daily_returns: dict[str, float] = {}
+        self._equity_history: deque[tuple[datetime, float]] = deque(maxlen=100000)
+        self._trade_returns: deque[float] = deque(maxlen=50000)
+        self._win_returns: deque[float] = deque(maxlen=50000)
+        self._loss_returns: deque[float] = deque(maxlen=50000)
+        self._execution_latencies: deque[float] = deque(maxlen=10000)
+        self._signal_to_order_latencies: deque[float] = deque(maxlen=10000)
 
         # Counts
         self._total_opportunities = 0
@@ -214,8 +215,10 @@ class AnalyticsTracker:
                 self._max_drawdown_pct = dd
 
     def record_latency(self, execution_ms: float, signal_to_order_ms: float) -> None:
-        self._execution_latencies.append(execution_ms)
-        self._signal_to_order_latencies.append(signal_to_order_ms)
+        if len(self._execution_latencies) < 10000:
+            self._execution_latencies.append(execution_ms)
+        if len(self._signal_to_order_latencies) < 10000:
+            self._signal_to_order_latencies.append(signal_to_order_ms)
 
     def record_allocation(
         self,

@@ -35,4 +35,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8080/health')"
 
-CMD ["python", "-m", "src.paper.engine"]
+CMD ["python", "scripts/run_paper_trading.py", "--duration", "0"]

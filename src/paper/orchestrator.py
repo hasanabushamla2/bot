@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
+import signal
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from src.data.event_bus import EventBus
 from src.data.feed_health import FeedHealthMonitor
 from src.data.normalization import BookLevel, CanonicalSymbol, TickerEvent
 from src.data.order_book import OrderBookEngine
+from src.db.persist import PaperPersistence
 from src.features.engine import FeatureEngine
 from src.opportunity.engine import OpportunityEngine
 from src.paper.account import PaperAccount
@@ -73,6 +76,7 @@ class PaperTradingOrchestrator:
         self.paper_exec = PaperExecutionEngine()
         self.monitor = PositionMonitor(self.account)
         self.analytics = AnalyticsTracker()
+        self._persist: PaperPersistence | None = None
 
         # ---- Event counters ----
         self.publish_count = 0
@@ -82,6 +86,13 @@ class PaperTradingOrchestrator:
         # ---- Bounded storage ----
         self._trade_log: deque[dict[str, Any]] = deque(maxlen=50000)
         self._error_log: deque[dict[str, Any]] = deque(maxlen=1000)
+        self._accepting_new = True
+        # Signal handlers
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
+            signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
+        except Exception:
+            pass
 
         self._running = False
         self._scan_interval = 5.0
@@ -122,6 +133,24 @@ class PaperTradingOrchestrator:
             await asyncio.gather(*tasks, return_exceptions=True)
             await self.event_bus.shutdown()
             await self.registry.shutdown_all()
+            if self._persist:
+                self._persist.audit("GRACEFUL_SHUTDOWN", "Clean stop")
+                self._persist.save_account(
+                    {
+                        "cash": self.account.state.cash,
+                        "initial_balance": self.account.state.initial_balance,
+                        "allocated": self.account.state.allocated,
+                        "realized_pnl": self.account.state.realized_pnl,
+                        "total_fees": self.account.state.total_fees,
+                        "total_slippage": self.account.state.total_slippage,
+                        "trade_count": self.account.state.trade_count,
+                        "win_count": self.account.state.win_count,
+                        "loss_count": self.account.state.loss_count,
+                        "peak_equity": self.account.state.peak_equity,
+                        "max_drawdown_pct": self.account.state.max_drawdown_pct,
+                    }
+                )
+                self._persist.close()
         return self._final_report()
 
     # ---- EventBus subscriber (BLOCKER 2: single canonical path) ----
@@ -265,7 +294,7 @@ class PaperTradingOrchestrator:
                 liquidity=liq,
                 volume_24h=feat.volume_24h,
                 spread_pct=liq.spread_pct,
-                data_age_seconds=0.0,
+                data_age_seconds=max(0.0, (datetime.now(UTC) - feat.updated_at).total_seconds()),
                 daily_trades=5000,
             )
             if not qr.qualified:
@@ -455,6 +484,25 @@ class PaperTradingOrchestrator:
 
     def stop(self) -> None:
         self._running = False
+        self._accepting_new = False
+
+    def _handle_signal(self) -> None:
+        logger.info("shutdown_signal_received")
+        self._accepting_new = False
+        self._running = False
+
+    def _get_experiment_id(self) -> str:
+        return os.environ.get(
+            "PAPER_EXPERIMENT_ID", f"paper-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+        )
+
+    def _get_commit_sha(self) -> str:
+        try:
+            import subprocess
+
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()[:8]
+        except Exception:
+            return "unknown"
 
     def estimate_10day_usage(self) -> dict[str, Any]:
         return {
