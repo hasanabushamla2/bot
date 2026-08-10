@@ -97,6 +97,7 @@ ignore = [
     "B027",  # empty methods in ABC are intentional hooks
     "E402",  # import-at-top — allowed for circular-import workarounds
     "N801",  # class name convention — TestF01_ prefix intentional
+    "N802",  # function name convention — test_A_J identifiers intentional
 ]
 
 [tool.ruff.lint.isort]

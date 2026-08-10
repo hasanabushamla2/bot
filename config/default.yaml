@@ -39,8 +39,8 @@ risk:
   circuit_breaker_drawdown_pct: 15.0
   circuit_breaker_consecutive_losses: 5
   # Trailing stop
-  trail_pct: 0.15                         # Distance from peak
-  trail_activation_pct: 0.15              # Profit to activate
+  trail_pct: 0.20                         # Distance from peak (0.20% — FINAL)
+  trail_activation_pct: 0.20              # Profit to activate (0.20% — FINAL)
   enable_fixed_take_profit: false         # ALWAYS false
 
 # --- Opportunity Engine ---

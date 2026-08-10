@@ -244,8 +244,8 @@ class TestTrailingStop:
             symbol="TEST-USD",
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 1, 2, tzinfo=UTC),
-            trail_activation_pct=0.30,
-            trail_pct=0.15,
+            trail_activation_pct=0.20,
+            trail_pct=0.20,
             initial_capital=10000.0,
         )
         engine = BacktestEngine(config)
@@ -253,7 +253,7 @@ class TestTrailingStop:
         prices = (
             [50000.0] * 5
             + list(np.linspace(50000, 50300, 20))
-            + list(np.linspace(50300, 50200, 15))
+            + list(np.linspace(50300, 50150, 15))
         )
         data = pd.DataFrame(
             {
@@ -281,7 +281,7 @@ class TestTrailingStop:
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 1, 2, tzinfo=UTC),
             trail_activation_pct=1.0,
-            trail_pct=0.15,
+            trail_pct=0.20,
             stop_loss_pct=0.50,
         )
         engine = BacktestEngine(config)
@@ -316,8 +316,8 @@ class TestTrailingStop:
             symbol="TEST-USD",
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 1, 3, tzinfo=UTC),
-            trail_activation_pct=0.15,
-            trail_pct=0.15,
+            trail_activation_pct=0.20,
+            trail_pct=0.20,
             initial_capital=10000.0,
         )
         engine = BacktestEngine(config)

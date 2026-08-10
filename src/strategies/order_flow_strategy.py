@@ -53,8 +53,8 @@ class OrderFlowStrategy(BaseStrategy):
             },
             exit_logic={
                 "hard_stop_pct": 0.30,
-                "trail_pct": 0.15,
-                "activation_pct": 0.15,
+                "trail_pct": 0.20,
+                "activation_pct": 0.20,
                 "no_fixed_take_profit": True,
             },
             metadata={

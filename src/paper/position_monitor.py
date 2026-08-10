@@ -26,7 +26,7 @@ class PositionMonitor:
         self.account = account
         self.trail_manager = TrailingStopManager(
             trail_config
-            or TrailConfig(trail_pct=0.15, activation_pct=0.15, enable_fixed_take_profit=False)
+            or TrailConfig(trail_pct=0.20, activation_pct=0.20, enable_fixed_take_profit=False)
         )
         self.hard_stop_pct = hard_stop_pct
         self._trail_states: dict[str, TrailState] = {}

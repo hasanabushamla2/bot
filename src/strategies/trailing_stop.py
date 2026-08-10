@@ -5,7 +5,7 @@ As price moves favorably, the trailing exit level follows at a
 configurable distance, protecting progressively more profit while
 allowing the position to capture extended moves.
 
-SUPPORTED TRAILING ALGORITHMS:
+SUPPORTED TRAILING ALGORITHMS (FINAL: trailing_delta=0.002=0.20%):
 - percentage_trail: Fixed percentage distance from peak
 - atr_trail: Distance based on Average True Range (volatility-aware)
 - step_trail: Discrete steps triggered at profit milestones
@@ -40,8 +40,8 @@ class TrailConfig:
     """Configuration for one trailing stop instance."""
 
     algorithm: TrailAlgorithm = TrailAlgorithm.PERCENTAGE
-    trail_pct: float = 0.15  # Distance from peak (e.g., 0.15% trail)
-    activation_pct: float = 0.15  # Profit needed before trail activates
+    trail_pct: float = 0.20  # Distance from peak (0.20% trail (FINAL))
+    activation_pct: float = 0.20  # Profit needed before trail activates (0.20% FINAL)
 
     # ATR parameters
     atr_period: int = 14
@@ -53,6 +53,7 @@ class TrailConfig:
 
     # Never set a fixed ceiling
     enable_fixed_take_profit: bool = False  # MUST be False per policy
+    trailing_delta: float = 0.002     # Retracement fraction (0.002 = 0.20%)
 
 
 @dataclass
@@ -254,7 +255,7 @@ class TrailingStopManager:
 
     def _trail_percentage(self, state: TrailState) -> float:
         """Percentage-based trail: peak * (1 - trail_pct/100)."""
-        pct = self.config.trail_pct / 100.0
+        pct = self.config.trailing_delta  # 0.002 = 0.20%
         if state.direction == TrailDirection.LONG:
             return state.peak_price * (1.0 - pct)
         else:
@@ -329,13 +330,13 @@ def compute_hard_stop(
 
 
 def compute_trail_config(
-    trail_pct: float = 0.15,
-    activation_pct: float = 0.15,
+    trail_pct: float = 0.20,
+    activation_pct: float = 0.20,
 ) -> TrailConfig:
     """Factory for the default trailing configuration.
 
-    Trail distance of 0.15% means once profit exceeds 0.15%,
-    the trailing stop follows at 0.15% below the peak.
+    Trail distance of 0.20% means once profit exceeds 0.20%,
+    the trailing stop follows at 0.20% below the peak.
     """
     return TrailConfig(
         algorithm=TrailAlgorithm.PERCENTAGE,

@@ -96,20 +96,20 @@ class TestPositionMonitor:
 
     def test_trailing_activation_and_exit(self) -> None:
         acct = PaperAccount(10000)
-        cfg = TrailConfig(trail_pct=0.15, activation_pct=0.15, enable_fixed_take_profit=False)
+        cfg = TrailConfig(trail_pct=0.20, activation_pct=0.20, trailing_delta=0.002, enable_fixed_take_profit=False)
         acct.open_position("BTC-USDT", "long", 50000, 0.1)
         pos = acct.state.open_positions["BTC-USDT"]
         monitor = PositionMonitor(acct, trail_config=cfg)
         monitor.register_position(pos)
-        # Rise above activation (50000 * 1.0015 = 50075)
+        # Rise above activation (50000 * 1.002 = 50100)
         pos.current_price = 50100
         exits = monitor.check_all()
         assert len(exits) == 0  # Not yet triggered
-        # Peak at 50200, trail = 50200 * 0.9985 = 50125
+        # Peak at 50200, trail = 50200 * 0.998 = 50099.6
         pos.current_price = 50200
         monitor.check_all()
         # Drop below trail
-        pos.current_price = 50120
+        pos.current_price = 50095
         exits = monitor.check_all()
         assert len(exits) > 0
         assert exits[0]["reason"] == "trail_hit"

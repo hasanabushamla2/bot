@@ -49,8 +49,8 @@ class BacktestConfig:
     - stop_loss_pct: 0.30 (HARD stop at -0.30%)
     - enable_take_profit: False (NO fixed profit ceiling)
     - enable_trailing_stop: True (trailing profit protection)
-    - trail_pct: 0.15 (trail distance from peak)
-    - trail_activation_pct: 0.15 (profit needed to activate trail)
+    - trail_pct: 0.20 (trail distance from peak — FINAL)
+    - trail_activation_pct: 0.20 (profit needed to activate trail)
     """
 
     symbol: str
@@ -72,8 +72,8 @@ class BacktestConfig:
 
     # --- TRAILING STOP ---
     enable_trailing_stop: bool = True
-    trail_pct: float = 0.15  # Trailing distance from peak
-    trail_activation_pct: float = 0.15  # Profit required to activate trail
+    trail_pct: float = 0.20  # Trailing distance from peak
+    trail_activation_pct: float = 0.20  # Profit required to activate trail
 
     # --- SPOT ONLY ---
     allow_short: bool = False  # MUST be False per spot-only policy
