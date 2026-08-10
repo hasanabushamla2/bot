@@ -95,6 +95,10 @@ class PositionMonitor:
         self._trail_states.pop(symbol, None)
         self._exit_intents.discard(symbol)
 
+    def rearm_position(self, symbol: str) -> None:
+        """R8: Clear exit intent so residual position can be re-checked after partial fill."""
+        self._exit_intents.discard(symbol)
+
     # N-10: Persistence support
     def get_trail_state(self, symbol: str) -> dict[str, Any] | None:
         ts = self._trail_states.get(symbol)

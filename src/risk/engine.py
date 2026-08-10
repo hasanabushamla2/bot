@@ -237,6 +237,13 @@ class RiskEngine:
         else:
             assessment.stop_loss_price = None
 
+        # --- Gate 9b: R8 — REJECT if stop cannot be computed for LONG ---
+        if assessment.stop_loss_price is None:
+            assessment.decision = RiskDecision.REJECTED
+            assessment.reason = RejectionReason.SPOT_ONLY
+            logger.warning("risk_rejected_no_stop", symbol=opportunity.signal.symbol)
+            return assessment
+
         # --- Gate 10: Trailing Stop (enabled, no fixed TP) ---
         # take_profit_price stays None — NO fixed profit ceiling per policy
         assessment.take_profit_price = None

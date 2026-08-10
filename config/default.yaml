@@ -46,7 +46,7 @@ risk:
 # --- Opportunity Engine ---
 opportunity:
   min_confidence: 0.5
-  min_net_return_pct: 0.05
+  min_net_return: 0.001  # R7: decimal fraction (was min_net_return_pct)
   min_fill_probability: 0.5
   max_correlation: 0.7
 
