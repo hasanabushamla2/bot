@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -17,9 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from src.backtesting.engine import BacktestConfig, BacktestEngine, PeriodType
 
 
-def dummy_strategy(data: "pd.DataFrame") -> dict | None:
+def dummy_strategy(data: pd.DataFrame) -> dict | None:
     """Placeholder — replace with real strategy."""
-    import pandas as pd
 
     if len(data) < 20:
         return None
@@ -52,14 +50,16 @@ def main() -> None:
     for _ in range(len(dates)):
         price *= np.exp(np.random.normal(0, 0.002))
         prices.append(price)
-    df = pd.DataFrame({
-        "timestamp": dates,
-        "open": prices,
-        "high": [p * 1.002 for p in prices],
-        "low": [p * 0.998 for p in prices],
-        "close": prices,
-        "volume": np.random.uniform(1, 100, len(dates)),
-    })
+    df = pd.DataFrame(
+        {
+            "timestamp": dates,
+            "open": prices,
+            "high": [p * 1.002 for p in prices],
+            "low": [p * 0.998 for p in prices],
+            "close": prices,
+            "volume": np.random.uniform(1, 100, len(dates)),
+        }
+    )
 
     config = BacktestConfig(
         symbol=args.symbol,
@@ -71,7 +71,7 @@ def main() -> None:
     result = engine.run(df, dummy_strategy, period_type=PeriodType.TEST)
 
     print(f"\nBacktest Results: {args.symbol} ({start.date()} → {end.date()})")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
     print(f"Total Trades:      {result.total_trades}")
     print(f"Win Rate:          {result.win_rate:.2%}")
     print(f"Net P&L:           ${result.net_pnl:,.2f}")

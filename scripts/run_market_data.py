@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 async def _ticker_printer(symbol: str, adapter: Any) -> None:
     """Print ticker updates for one symbol."""
     async for ticker in adapter.subscribe_ticker(symbol):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         spread = ticker.ask - ticker.bid
         spread_bps = (spread / ticker.last * 10000) if ticker.last > 0 else 0
         print(
@@ -61,19 +61,26 @@ async def _trade_printer(symbol: str, adapter: Any) -> None:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Live Market Data Demo")
     parser.add_argument(
-        "--duration", type=int, default=30,
+        "--duration",
+        type=int,
+        default=30,
         help="Run duration in seconds (default: 30)",
     )
     parser.add_argument(
-        "--symbols", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT",
+        "--symbols",
+        type=str,
+        default="BTCUSDT,ETHUSDT,SOLUSDT",
         help="Comma-separated symbols (default: BTCUSDT,ETHUSDT,SOLUSDT)",
     )
     parser.add_argument(
-        "--streams", type=str, default="ticker,book",
+        "--streams",
+        type=str,
+        default="ticker,book",
         help="Streams to subscribe: ticker,book,trades (default: ticker,book)",
     )
     parser.add_argument(
-        "--testnet", action="store_true",
+        "--testnet",
+        action="store_true",
         help="Use Binance testnet instead of production",
     )
     args = parser.parse_args()
@@ -89,12 +96,12 @@ async def main() -> None:
     )
 
     print("=" * 75)
-    print(f"  QUANT ENGINE — LIVE MARKET DATA DEMO")
+    print("  QUANT ENGINE — LIVE MARKET DATA DEMO")
     print(f"  Exchange: {'Binance Testnet' if args.testnet else 'Binance'}")
     print(f"  Symbols:  {', '.join(symbols)}")
     print(f"  Streams:  {', '.join(streams)}")
     print(f"  Duration: {args.duration}s")
-    print(f"  Mode:     PUBLIC DATA — NO ORDERS")
+    print("  Mode:     PUBLIC DATA — NO ORDERS")
     print("=" * 75)
 
     await adapter.connect()
@@ -106,7 +113,7 @@ async def main() -> None:
         return
 
     server_time = await adapter.get_server_time()
-    local_time = datetime.now(timezone.utc)
+    local_time = datetime.now(UTC)
     offset_ms = (server_time - local_time).total_seconds() * 1000
     print(f"\n  Server time: {server_time.isoformat()}")
     print(f"  Local time:  {local_time.isoformat()}")

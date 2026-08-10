@@ -4,7 +4,9 @@
 NO real orders. NO API keys.
 Usage: python scripts/run_paper_trading.py --starting-balance 10000 --duration 60
 """
+
 from __future__ import annotations
+
 import argparse
 import asyncio
 import sys
