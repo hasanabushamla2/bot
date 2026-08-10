@@ -94,13 +94,17 @@ class TestRiskEngine:
         assert result.stop_loss_price == pytest.approx(49850.0, rel=0.01)
 
     def test_stop_loss_calculation_short(self) -> None:
+        """Short positions are rejected per SPOT-ONLY policy.
+        The hard stop math still works correctly for shorts,
+        but the risk engine gate rejects them before computing it."""
         engine = RiskEngine()
         opp = make_evaluated_opportunity(direction=SignalDirection.SHORT)
         opp.signal.metadata["entry_price"] = 50000.0
         result = engine.assess(opp)
-        # +0.3% stop for short: 50000 * 1.003 = 50150
-        assert result.stop_loss_price is not None
-        assert result.stop_loss_price == pytest.approx(50150.0, rel=0.01)
+        # SPOT-ONLY: short signals are rejected
+        assert result.decision == RiskDecision.REJECTED
+        assert result.reason is not None
+        assert "spot_only" in str(result.reason.value)
 
     def test_reset_kill_switch(self) -> None:
         engine = RiskEngine()

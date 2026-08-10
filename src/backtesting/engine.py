@@ -1,5 +1,14 @@
 """Backtesting Engine — realistic historical simulation.
 
+FINAL POLICY (v1.0):
+- SPOT only, no leverage, no margin
+- HARD STOP: -0.30% per position
+- NO FIXED TAKE PROFIT
+- TRAILING STOP for profit protection
+- 100+ altcoin universe
+- Opportunity-driven trade count
+- Dynamic capital allocation
+
 CRITICAL DESIGN RULES:
 - NEVER use future information (no look-ahead bias).
 - Always include fees, spread, slippage.
@@ -34,7 +43,15 @@ class PeriodType(str, Enum):
 
 @dataclass
 class BacktestConfig:
-    """Configuration for a backtest run."""
+    """Configuration for a backtest run.
+
+    FINAL TRADING POLICY CONFIGURATION:
+    - stop_loss_pct: 0.30 (HARD stop at -0.30%)
+    - enable_take_profit: False (NO fixed profit ceiling)
+    - enable_trailing_stop: True (trailing profit protection)
+    - trail_pct: 0.15 (trail distance from peak)
+    - trail_activation_pct: 0.15 (profit needed to activate trail)
+    """
 
     symbol: str
     start_date: datetime
@@ -46,7 +63,20 @@ class BacktestConfig:
     latency_ms: float = 100.0  # Assumed execution latency
     min_fill_probability: float = 0.95
     max_position_size_pct: float = 0.1  # Max 10% of capital per position
-    stop_loss_pct: float = 0.3  # 0.3% stop loss
+
+    # --- FINAL STOP LOSS: -0.30% ---
+    stop_loss_pct: float = 0.30  # -0.30% hard stop (FINAL)
+
+    # --- NO FIXED TAKE PROFIT ---
+    enable_take_profit: bool = False  # MUST be False per policy
+
+    # --- TRAILING STOP ---
+    enable_trailing_stop: bool = True
+    trail_pct: float = 0.15  # Trailing distance from peak
+    trail_activation_pct: float = 0.15  # Profit required to activate trail
+
+    # --- SPOT ONLY ---
+    allow_short: bool = False  # MUST be False per spot-only policy
 
     # Required anti-bias controls
     train_end: datetime | None = None
@@ -56,7 +86,7 @@ class BacktestConfig:
 
 @dataclass
 class BacktestTrade:
-    """A single simulated trade."""
+    """A single simulated trade with complete audit trail."""
 
     entry_time: datetime
     exit_time: datetime
@@ -65,12 +95,28 @@ class BacktestTrade:
     entry_price: float
     exit_price: float
     quantity: float
+
+    # P&L components
     gross_pnl: float
     fees: float
     slippage_cost: float
     net_pnl: float
     return_pct: float
-    exit_reason: str = "signal"  # "signal", "stop_loss", "take_profit"
+
+    # Exit tracking
+    exit_reason: str = "signal"
+    # "hard_stop", "trail_hit", "signal", "eod"
+
+    # Stop loss audit
+    target_stop_price: float = 0.0  # Where the hard stop was set
+    actual_exit_price: float = 0.0  # Where the exit actually happened
+    stop_slippage_pct: float = 0.0  # Difference between target and actual
+
+    # Trailing stop audit
+    trail_peak_price: float = 0.0  # Peak price achieved during position
+    trail_exit_level: float = 0.0  # Price at which trail triggered exit
+    trail_captured_pct: float = 0.0  # % return captured by trail
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -99,18 +145,22 @@ class BacktestResult:
     expectancy: float = 0.0
     equity_curve: list[float] = field(default_factory=list)
     period_type: PeriodType = PeriodType.TEST
+
+    # Stop-loss audit
+    avg_stop_slippage_pct: float = 0.0
+    hard_stop_exits: int = 0
+    trail_exits: int = 0
+
+    # Timing
+    avg_holding_time_minutes: float = 0.0
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BacktestEngine:
-    """Realistic backtesting with anti-bias protections.
+    """Realistic backtesting with anti-bias protections and trailing stops.
 
-    Key anti-bias measures:
-    1. Data is split into train/validation/test periods.
-    2. The test period is NEVER used for optimization.
-    3. Walk-forward analysis is supported.
-    4. Fees, spread, and slippage are always included.
-    5. Future data leakage is explicitly checked.
+    FINAL CONFIGURATION: SPOT, -0.30% stop, trailing stop, NO fixed TP.
     """
 
     def __init__(self, config: BacktestConfig) -> None:
@@ -118,13 +168,18 @@ class BacktestEngine:
         self._ensure_period_separation()
 
     def _ensure_period_separation(self) -> None:
-        """Validate period separation to prevent data leakage."""
-        if self.config.train_end and self.config.validation_end:
-            if self.config.train_end >= self.config.validation_end:
-                raise ValueError("train_end must be before validation_end")
-        if self.config.validation_end and self.config.test_start:
-            if self.config.validation_end >= self.config.test_start:
-                raise ValueError("validation_end must be before test_start")
+        if (
+            self.config.train_end
+            and self.config.validation_end
+            and self.config.train_end >= self.config.validation_end
+        ):
+            raise ValueError("train_end must be before validation_end")
+        if (
+            self.config.validation_end
+            and self.config.test_start
+            and self.config.validation_end >= self.config.test_start
+        ):
+            raise ValueError("validation_end must be before test_start")
 
     def run(
         self,
@@ -132,85 +187,134 @@ class BacktestEngine:
         strategy_fn: Callable[..., Any],
         period_type: PeriodType = PeriodType.TEST,
     ) -> BacktestResult:
-        """Run backtest over provided historical data.
+        """Run backtest over historical OHLCV data.
 
-        Args:
-            data: DataFrame with columns: [timestamp, open, high, low, close, volume,
-                  bid (optional), ask (optional)].
-            strategy_fn: Callable that takes market data snapshot and returns
-                        signal dict or None.
-            period_type: Which period this run belongs to (train/val/test).
-
-        Returns:
-            BacktestResult with full trade log and metrics.
+        Logic per bar:
+        1. Check existing position: hard stop? trailing stop?
+        2. Strategy signal? → open new position if no position.
+        3. Always record equity.
         """
-        # Validate required columns
-        required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
-        missing = required_cols - set(data.columns)
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        missing = required - set(data.columns)
         if missing:
-            raise ValueError(f"Data missing required columns: {missing}")
-
-        # Sort by timestamp
+            raise ValueError(f"Missing columns: {missing}")
         data = data.sort_values("timestamp").reset_index(drop=True)
 
         trades: list[BacktestTrade] = []
         equity = self.config.initial_capital
         equity_curve: list[float] = [equity]
         position: dict[str, Any] | None = None
+        trail_peak: float = 0.0
+        trail_activated: bool = False
 
         for i in range(len(data)):
             row = data.iloc[i]
             current_time = row["timestamp"]
+            current_price = row["close"]
 
-            # --- Check stop loss on open position ---
+            # --- Check existing position ---
             if position is not None:
-                stop_price = position["stop_loss"]
-                tp_price = position.get("take_profit")
-                current_price = row["close"]
                 exit_reason: str | None = None
+                exit_price_actual: float | None = None
+
+                # Update trailing peak
+                trail_level = position.get("trail_level", 0.0)
+                if position["direction"] == "long" and current_price > trail_peak:
+                    trail_peak = current_price
+                    # Activate trail after reaching activation threshold
+                    if not trail_activated:
+                        trail_activation_price = position["entry_price"] * (
+                            1.0 + self.config.trail_activation_pct / 100.0
+                        )
+                        if current_price >= trail_activation_price:
+                            trail_activated = True
+                    if trail_activated:
+                        trail_level = trail_peak * (1.0 - self.config.trail_pct / 100.0)
+                        position["trail_level"] = trail_level
+                        position["trail_peak"] = trail_peak
+
+                # 1. Hard stop check (-0.30%)
+                stop_price = position["stop_loss"]
+                tp_price = position.get("take_profit") if self.config.enable_take_profit else None
 
                 if position["direction"] == "long":
                     if current_price <= stop_price:
-                        exit_reason = "stop_loss"
+                        exit_reason = "hard_stop"
+                        exit_price_actual = current_price
                     elif tp_price and current_price >= tp_price:
                         exit_reason = "take_profit"
-                else:  # short
+                        exit_price_actual = current_price
+                    elif trail_activated and current_price <= trail_level:
+                        exit_reason = "trail_hit"
+                        exit_price_actual = current_price
+                else:
                     if current_price >= stop_price:
-                        exit_reason = "stop_loss"
+                        exit_reason = "hard_stop"
+                        exit_price_actual = current_price
                     elif tp_price and current_price <= tp_price:
                         exit_reason = "take_profit"
+                        exit_price_actual = current_price
+                    elif trail_activated and current_price >= trail_level:
+                        exit_reason = "trail_hit"
+                        exit_price_actual = current_price
+                    elif trail_activated and trail_level > 0:
+                        pass  # Short trail not fully implemented
 
                 if exit_reason:
-                    trade = self._close_position(position, current_price, current_time, exit_reason)
+                    trade = self._close_position(
+                        position,
+                        exit_price_actual or current_price,
+                        current_time,
+                        exit_reason,
+                        trail_peak=trail_peak,
+                        trail_level=trail_level,
+                    )
                     trades.append(trade)
                     equity += trade.net_pnl
                     equity_curve.append(equity)
                     position = None
+                    trail_peak = 0.0
+                    trail_activated = False
 
-            # --- Strategy signal ---
-            # Slice data up to CURRENT row only (NO look-ahead)
-            market_snapshot = data.iloc[: i + 1].copy()
-            try:
-                signal = strategy_fn(market_snapshot)
-            except Exception as e:
-                logger.warning("strategy_error", index=i, error=str(e))
-                continue
+            # --- Strategy signal (only if no position) ---
+            if position is None:
+                market_snapshot = data.iloc[: i + 1].copy()
+                try:
+                    signal = strategy_fn(market_snapshot)
+                except Exception as e:
+                    logger.warning("strategy_error", index=i, error=str(e))
+                    continue
 
-            if signal is not None and position is None:
-                # Open new position
-                entry_price = self._apply_slippage(row["close"], signal.get("direction", "long"))
-                position = self._open_position(signal, entry_price, current_time, equity)
-                equity_curve.append(equity)  # Equity doesn't change on entry (only on exit)
+                if signal is not None:
+                    # SPOT-ONLY: reject short signals
+                    direction = signal.get("direction", "long")
+                    if direction == "short" and not self.config.allow_short:
+                        continue
 
-        # Close any remaining position at last price
+                    entry_price = self._apply_slippage(current_price, direction)
+                    position = self._open_position(signal, entry_price, current_time, equity)
+                    trail_peak = entry_price
+                    trail_activated = False
+
+        # Close remaining position at last price
         if position is not None:
             last_price = data.iloc[-1]["close"]
-            trade = self._close_position(position, last_price, data.iloc[-1]["timestamp"], "eod")
+            if len(data) > 0:
+                last_row = data.iloc[-1]
+                last_price = last_row["close"]
+
+            trade = self._close_position(
+                position,
+                last_price,
+                data.iloc[-1]["timestamp"],
+                "eod",
+                trail_peak=trail_peak,
+                trail_level=position.get("trail_level", 0.0),
+            )
             trades.append(trade)
             equity += trade.net_pnl
             equity_curve.append(equity)
 
-        # --- Compute metrics ---
         return self._compute_metrics(trades, equity_curve, period_type)
 
     def walk_forward(
@@ -220,11 +324,6 @@ class BacktestEngine:
         train_window_days: int = 90,
         test_window_days: int = 30,
     ) -> list[BacktestResult]:
-        """Run walk-forward analysis with rolling train/test windows.
-
-        Each window: train on previous N days, test on next M days.
-        Never uses future data for training.
-        """
         results: list[BacktestResult] = []
         data = data.sort_values("timestamp").reset_index(drop=True)
         min_time = data["timestamp"].min()
@@ -244,20 +343,8 @@ class BacktestEngine:
             if len(test_data) < 10:
                 break
 
-            # Train on past data only
-            logger.info(
-                "walk_forward_window",
-                window=window_idx,
-                train_start=current_start.isoformat(),
-                train_end=train_end.isoformat(),
-                test_start=train_end.isoformat(),
-                test_end=test_end.isoformat(),
-            )
-
-            # Run on test window
             result = self.run(test_data, strategy_fn, PeriodType.TEST)
             result.metadata["walk_forward_window"] = window_idx
-            result.metadata["train_period"] = f"{current_start.date()} → {train_end.date()}"
             result.metadata["test_period"] = f"{train_end.date()} → {test_end.date()}"
             results.append(result)
 
@@ -271,7 +358,6 @@ class BacktestEngine:
     def _open_position(
         self, signal: dict[str, Any], entry_price: float, entry_time: datetime, equity: float
     ) -> dict[str, Any]:
-        """Open a simulated position."""
         direction = signal.get("direction", "long")
         capital_pct = min(
             signal.get("size_pct", self.config.max_position_size_pct),
@@ -280,29 +366,29 @@ class BacktestEngine:
         capital = equity * capital_pct
         quantity = capital / entry_price
 
-        stop_loss_pct = signal.get("stop_loss_pct", self.config.stop_loss_pct) / 100.0
-        stop_loss = (
-            entry_price * (1 - stop_loss_pct)
-            if direction == "long"
-            else entry_price * (1 + stop_loss_pct)
-        )
-
-        take_profit = None
-        tp_pct = signal.get("take_profit_pct")
-        if tp_pct:
-            tp_pct = tp_pct / 100.0
-            take_profit = (
-                entry_price * (1 + tp_pct) if direction == "long" else entry_price * (1 - tp_pct)
-            )
+        # Hard stop: -0.30% (FINAL)
+        stop_loss_pct = self.config.stop_loss_pct
+        signal_stop = signal.get("stop_loss_pct")
+        if signal_stop is not None:
+            stop_loss_pct = float(signal_stop)
+        pct = stop_loss_pct / 100.0
+        stop_loss = entry_price * (1.0 - pct) if direction == "long" else entry_price * (1.0 + pct)
 
         return {
             "direction": direction,
             "entry_price": entry_price,
             "quantity": quantity,
             "entry_time": entry_time,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
             "capital": capital,
+            # Hard stop
+            "stop_loss": stop_loss,
+            "stop_loss_pct": stop_loss_pct,
+            # NO fixed take profit
+            "take_profit": None,
+            # Trailing
+            "trail_level": 0.0,
+            "trail_peak": 0.0,
+            "trail_activated": False,
         }
 
     def _close_position(
@@ -311,28 +397,42 @@ class BacktestEngine:
         exit_price: float,
         exit_time: datetime,
         reason: str,
+        trail_peak: float = 0.0,
+        trail_level: float = 0.0,
     ) -> BacktestTrade:
-        """Close a simulated position and compute P&L."""
         direction = position["direction"]
         entry_price = position["entry_price"]
         quantity = position["quantity"]
 
-        exit_price = self._apply_slippage(exit_price, "long" if direction == "short" else "short")
+        exit_price = self._apply_slippage(exit_price, "long")
 
         if direction == "long":
             gross_pnl = (exit_price - entry_price) * quantity
         else:
             gross_pnl = (entry_price - exit_price) * quantity
 
-        # Fees (taker for entry + exit)
         notional = entry_price * quantity + exit_price * quantity
         fees = notional * self.config.taker_fee
-
-        # Slippage cost
         slippage_cost = notional * (self.config.slippage_bps / 10000.0)
-
         net_pnl = gross_pnl - fees - slippage_cost
         return_pct = (net_pnl / position["capital"]) * 100 if position["capital"] > 0 else 0.0
+
+        # --- Stop-loss audit ---
+        target_stop = position["stop_loss"]
+        actual_exit = exit_price
+        if reason == "hard_stop":
+            stop_slip = (actual_exit - target_stop) / target_stop * 100.0
+            if direction == "long":
+                stop_slip = -abs(stop_slip)
+            else:
+                stop_slip = abs(stop_slip)
+        else:
+            stop_slip = 0.0
+
+        # --- Trail audit ---
+        captured_pct = 0.0
+        if trail_level > 0 and trail_level > entry_price and "long" in direction:
+            captured_pct = (trail_level - entry_price) / entry_price * 100.0
 
         return BacktestTrade(
             entry_time=position["entry_time"],
@@ -348,6 +448,12 @@ class BacktestEngine:
             net_pnl=net_pnl,
             return_pct=return_pct,
             exit_reason=reason,
+            target_stop_price=target_stop,
+            actual_exit_price=actual_exit,
+            stop_slippage_pct=stop_slip,
+            trail_peak_price=trail_peak,
+            trail_exit_level=trail_level,
+            trail_captured_pct=captured_pct,
         )
 
     # --- Metrics ---
@@ -355,7 +461,6 @@ class BacktestEngine:
     def _compute_metrics(
         self, trades: list[BacktestTrade], equity_curve: list[float], period_type: PeriodType
     ) -> BacktestResult:
-        """Compute comprehensive backtest metrics."""
         result = BacktestResult(config=self.config, period_type=period_type)
         result.trades = trades
 
@@ -402,19 +507,29 @@ class BacktestEngine:
         )
         result.equity_curve = equity_curve
 
+        # Stop-loss audit
+        hard_stops = [t for t in trades if t.exit_reason == "hard_stop"]
+        result.hard_stop_exits = len(hard_stops)
+        result.avg_stop_slippage_pct = (
+            float(np.mean([abs(t.stop_slippage_pct) for t in hard_stops])) if hard_stops else 0.0
+        )
+
+        # Trail audit
+        result.trail_exits = len([t for t in trades if t.exit_reason == "trail_hit"])
+
+        # Holding time
+        if trades:
+            durations = [(t.exit_time - t.entry_time).total_seconds() / 60.0 for t in trades]
+            result.avg_holding_time_minutes = float(np.mean(durations))
+
         return result
 
-    # --- Slippage ---
-
     def _apply_slippage(self, price: float, direction: str) -> float:
-        """Apply realistic slippage to an execution price."""
         bps = self.config.slippage_bps / 10000.0
         if direction == "long":
-            return price * (1 + bps)  # Buy higher
+            return price * (1 + bps)
         else:
-            return price * (1 - bps)  # Sell lower
-
-    # --- Metric helpers (static for testability) ---
+            return price * (1 - bps)
 
     @staticmethod
     def _profit_factor(trades: list[BacktestTrade]) -> float:

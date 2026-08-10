@@ -3,6 +3,19 @@
 # Environment variables OVERRIDE these values.
 # This file defines safe defaults.
 
+# Quant Opportunity Engine — FINAL V1.0 POLICY CONFIGURATION
+# ==========================================================
+#
+# MARKET:               SPOT ONLY — no leverage/margin/futures/shorts
+# STOP LOSS:            -0.30% HARD STOP
+# TAKE PROFIT:          NONE — no fixed profit ceiling
+# PROFIT MANAGEMENT:    Trailing stop only
+# TRADE COUNT:          Opportunity-driven, no fixed daily count
+# CAPITAL:              Dynamic, liquidity-aware allocation
+# CAPITAL RECYCLING:    Immediate after position exit
+#
+# LIVE TRADING:         DISABLED BY DEFAULT
+
 # --- Mode (MUST be "paper" for safety) ---
 mode: paper
 live_trading_enabled: false
@@ -13,17 +26,22 @@ database:
   pool_overflow: 10
   echo: false
 
-# --- Risk (configurable, overridable per strategy) ---
+# --- Risk (FINAL POLICY V1.0) ---
+# SPOT ONLY — no leverage, margin, futures, short selling
 risk:
   max_position_size_usd: 1000.0
   max_total_exposure_usd: 10000.0
   max_drawdown_pct: 10.0
-  default_stop_loss_pct: 0.3
-  max_leverage: 1.0
+  default_stop_loss_pct: 0.30            # FINAL: -0.30% HARD STOP
+  max_leverage: 1.0                       # SPOT ONLY: 1.0x
   max_positions_per_strategy: 10
   max_correlated_exposure_pct: 25.0
   circuit_breaker_drawdown_pct: 15.0
   circuit_breaker_consecutive_losses: 5
+  # Trailing stop
+  trail_pct: 0.15                         # Distance from peak
+  trail_activation_pct: 0.15              # Profit to activate
+  enable_fixed_take_profit: false         # ALWAYS false
 
 # --- Opportunity Engine ---
 opportunity:

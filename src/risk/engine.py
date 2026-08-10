@@ -3,6 +3,14 @@
 The Risk Engine is a completely independent module. Strategies CANNOT
 bypass it. Every opportunity must pass risk validation before execution.
 
+FINAL POLICY (v1.0):
+- MARKET: SPOT ONLY — no leverage, margin, futures, short selling
+- HARD STOP LOSS: -0.30% per position
+- TAKE PROFIT: NONE — no fixed profit ceiling
+- PROFIT MANAGEMENT: Trailing stop only
+- TRADE COUNT: Opportunity-driven, no fixed daily count
+- CAPITAL: Dynamically allocated per liquidity and opportunity quality
+
 Configurable:
 - Position sizing
 - Maximum exposure (total, per-market, per-strategy)
@@ -11,7 +19,8 @@ Configurable:
 - Circuit breakers
 - Emergency kill switch
 - Stale-data protection
-- Stop-loss enforcement
+- Hard stop-loss enforcement (-0.30%)
+- Trailing stop management
 """
 
 from __future__ import annotations
@@ -49,20 +58,28 @@ class RejectionReason(str, Enum):
     LIQUIDITY = "liquidity"
     VOLATILITY = "volatility"
     STOP_LOSS_TRIGGERED = "stop_loss_triggered"
-    CONFIG_ERROR = "config_error"
+    # Spot-only enforcement — no short selling
+    SPOT_ONLY = "spot_only"
 
 
 @dataclass
 class RiskAssessment:
-    """Result of risk evaluation for an opportunity."""
+    """Result of risk evaluation for an opportunity.
+
+    FINAL CONFIGURATION:
+    - stop_loss_price: ALWAYS set to the -0.30% hard stop
+    - take_profit_price: ALWAYS None (no fixed profit ceiling)
+    - trailing_stop_config: trailing stop parameters for profit protection
+    """
 
     opportunity: EvaluatedOpportunity
     decision: RiskDecision = RiskDecision.REJECTED
     reason: RejectionReason | None = None
     max_position_size: float = 0.0
     suggested_entry_price: float | None = None
-    stop_loss_price: float | None = None
-    take_profit_price: float | None = None
+    stop_loss_price: float | None = None  # Hard stop at -0.30%
+    take_profit_price: float | None = None  # ALWAYS None — fixed TP disabled
+    trailing_stop_enabled: bool = True  # Trailing stop for profit protection
     assessed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -198,19 +215,32 @@ class RiskEngine:
 
         assessment.max_position_size = position_size
 
-        # --- Gate 8: Stop Loss ---
-        signal = opportunity.signal
-        stop_loss_pct: float = float(
-            signal.metadata.get("stop_loss_pct", self.default_stop_loss_pct)
-        )
-        assessment.stop_loss_price = self._compute_stop_loss(signal, stop_loss_pct)
-
-        # --- Gate 9: Take Profit ---
-        take_profit_pct_raw = signal.metadata.get("take_profit_pct", None)
-        if take_profit_pct_raw is not None:
-            assessment.take_profit_price = self._compute_take_profit(
-                signal, float(take_profit_pct_raw)
+        # --- Gate 8: SPOT-ONLY enforcement ---
+        # No short selling, no leverage, no margin, no futures
+        if opportunity.signal.direction.value == "short":
+            assessment.reason = RejectionReason.SPOT_ONLY
+            logger.info(
+                "risk_rejected_spot_only",
+                symbol=opportunity.signal.symbol,
+                direction=opportunity.signal.direction.value,
             )
+            return assessment
+
+        # --- Gate 9: Hard Stop Loss (-0.30% FINAL) ---
+        signal = opportunity.signal
+        hard_stop_pct: float = self.default_stop_loss_pct  # -0.30% FINAL
+        entry_price = signal.metadata.get("entry_price", None)
+        if entry_price is not None:
+            assessment.stop_loss_price = _compute_hard_stop(
+                float(entry_price), signal.direction.value, hard_stop_pct
+            )
+        else:
+            assessment.stop_loss_price = None
+
+        # --- Gate 10: Trailing Stop (enabled, no fixed TP) ---
+        # take_profit_price stays None — NO fixed profit ceiling per policy
+        assessment.take_profit_price = None
+        assessment.trailing_stop_enabled = True
 
         # --- PASSED ---
         assessment.decision = RiskDecision.APPROVED
@@ -219,6 +249,8 @@ class RiskEngine:
             strategy=strategy_id,
             symbol=opportunity.signal.symbol,
             position_size=position_size,
+            stop_loss=assessment.stop_loss_price,
+            trailing_stop=True,
         )
 
         return assessment
@@ -285,29 +317,15 @@ class RiskEngine:
 
     # --- Helpers ---
 
-    def _compute_stop_loss(self, signal: StrategySignal, stop_loss_pct: float) -> float | None:
-        """Compute stop loss price based on signal direction and percentage."""
-        ticker_price_raw = signal.metadata.get("entry_price")
-        if ticker_price_raw is None:
-            return None
-        ticker_price = float(ticker_price_raw)
-        pct = stop_loss_pct / 100.0
-        if signal.direction.value == "long":
-            return ticker_price * (1 - pct)
-        else:
-            return ticker_price * (1 + pct)
 
-    def _compute_take_profit(self, signal: StrategySignal, take_profit_pct: float) -> float | None:
-        """Compute take profit price."""
-        ticker_price_raw = signal.metadata.get("entry_price")
-        if ticker_price_raw is None:
-            return None
-        ticker_price = float(ticker_price_raw)
-        pct = take_profit_pct / 100.0
-        if signal.direction.value == "long":
-            return ticker_price * (1 + pct)
-        else:
-            return ticker_price * (1 - pct)
+def _compute_hard_stop(entry_price: float, direction: str, stop_loss_pct: float) -> float | None:
+    """Compute hard stop-loss price.
 
-
-from src.strategies.base import StrategySignal
+    FINAL CONFIGURATION: -0.30% per position.
+    The system records TARGET STOP vs ACTUAL EXIT PRICE separately.
+    """
+    pct = stop_loss_pct / 100.0
+    if direction == "long":
+        return entry_price * (1.0 - pct)
+    else:
+        return entry_price * (1.0 + pct)

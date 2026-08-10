@@ -112,7 +112,7 @@ class TestBacktestEngine:
             symbol="BTC-USD",
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 1, 2, tzinfo=UTC),
-            stop_loss_pct=0.1,  # Very tight stop
+            stop_loss_pct=0.30,  # FINAL: -0.30%
             initial_capital=10000.0,
         )
         engine = BacktestEngine(config)
@@ -138,7 +138,7 @@ class TestBacktestEngine:
 
         result = engine.run(data, always_long, period_type=PeriodType.TEST)
         # Check if any trade exited via stop loss
-        stop_loss_trades = [t for t in result.trades if t.exit_reason == "stop_loss"]
+        stop_loss_trades = [t for t in result.trades if t.exit_reason == "hard_stop"]
         assert len(stop_loss_trades) > 0, "At least one trade should trigger stop loss"
 
     def test_period_separation_enforced(self) -> None:

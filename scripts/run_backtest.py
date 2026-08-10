@@ -28,9 +28,7 @@ def dummy_strategy(data: "pd.DataFrame") -> dict | None:
     sma_long = close.rolling(20).mean().iloc[-1]
     if sma_short > sma_long:
         return {"direction": "long", "size_pct": 0.1}
-    elif sma_short < sma_long:
-        return {"direction": "short", "size_pct": 0.1}
-    return None
+    return None  # Only long signals — SPOT ONLY
 
 
 def main() -> None:
