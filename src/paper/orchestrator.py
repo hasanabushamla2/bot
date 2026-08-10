@@ -1,4 +1,5 @@
 """Paper Trading Orchestrator — R3: event-driven pipeline with all modules wired."""
+
 from __future__ import annotations
 
 import asyncio
@@ -35,9 +36,13 @@ logger = get_logger(__name__)
 class PaperTradingOrchestrator:
     """R3: All runtime modules wired. Event-driven architecture."""
 
-    def __init__(self, symbols: list[str] | None = None,
-                 initial_balance: float = 10_000.0, max_symbols: int = 50,
-                 use_testnet: bool = False) -> None:
+    def __init__(
+        self,
+        symbols: list[str] | None = None,
+        initial_balance: float = 10_000.0,
+        max_symbols: int = 50,
+        use_testnet: bool = False,
+    ) -> None:
         raw_symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         self._raw_to_canonical: dict[str, str] = {}
         self._canonical_symbols: list[str] = []
@@ -122,8 +127,8 @@ class PaperTradingOrchestrator:
                         if ticker and ticker.last > 0:
                             # R3: FeedHealth — record message receipt
                             self.feed_health.record_message(
-                                "binance", canonical, "ticker",
-                                exchange_ts=ticker.timestamp)
+                                "binance", canonical, "ticker", exchange_ts=ticker.timestamp
+                            )
                             # R3: Check health before updating
                             health = self.feed_health.get("binance", canonical, "ticker")
                             if health and not health.is_healthy:
@@ -154,17 +159,24 @@ class PaperTradingOrchestrator:
             exit_notional = exit_price * qty
             exit_fee = exit_notional * 0.001
             trade = self.account.close_position(
-                sym, exit_price, fees=exit_fee,
+                sym,
+                exit_price,
+                fees=exit_fee,
                 slippage=exit_notional * 0.0005,
                 exit_reason=ex["reason"],
                 trail_peak=ex.get("trail_peak", 0.0),
-                trail_level=ex.get("trail_level", 0.0))
+                trail_level=ex.get("trail_level", 0.0),
+            )
             self.monitor.unregister_position(sym)
             if trade:
                 self.analytics.record_trade(
-                    trade.gross_pnl, trade.net_pnl, trade.fees,
+                    trade.gross_pnl,
+                    trade.net_pnl,
+                    trade.fees,
                     slippage=trade.slippage_cost,
-                    strategy_id=trade.strategy_id, exchange="binance")
+                    strategy_id=trade.strategy_id,
+                    exchange="binance",
+                )
         # 2. R3: Build AssetSnapshots for GlobalScanner
         snapshots: list[AssetSnapshot] = []
         for canonical in self._canonical_symbols:
@@ -172,16 +184,20 @@ class PaperTradingOrchestrator:
             if feat.sample_count < 10:
                 continue
             snap = AssetSnapshot(
-                symbol=canonical, exchange="binance",
+                symbol=canonical,
+                exchange="binance",
                 asset_class=AssetClass.CRYPTO_SPOT,
-                last_price=feat.last_price, bid=feat.bid, ask=feat.ask,
+                last_price=feat.last_price,
+                bid=feat.bid,
+                ask=feat.ask,
                 spread_pct=feat.spread_bps / 100.0 if feat.spread_bps > 0 else 0.0,
                 volume_24h=feat.volume_24h,
                 price_change_1m_pct=feat.return_1m_pct,
                 price_change_5m_pct=feat.return_5m_pct,
                 volume_vs_avg_ratio=feat.relative_volume,
                 bid_ask_ratio=feat.bid_ask_ratio,
-                depth_bid_10bps=feat.bid_depth_10bps)
+                depth_bid_10bps=feat.bid_depth_10bps,
+            )
             snapshots.append(snap)
         # 3. R3: GlobalScanner produces ranked signals
         scanner_signals = self.scanner.scan(snapshots)
@@ -232,9 +248,8 @@ class PaperTradingOrchestrator:
             entry_price = self.features.get(sym).last_price
             if entry_price <= 0:
                 try:
-                    raw = next(
-                        r for r, c in self._raw_to_canonical.items() if c == sym)
-                    t = await self.adapter.get_ticker(raw)
+                    raw = next(r for r, c in self._raw_to_canonical.items() if c == sym)
+                    t = await self.adapter.get_ticker  # type: ignore[union-attr](raw)
                     entry_price = t.last if t and t.last > 0 else 0
                 except Exception:
                     continue
@@ -244,13 +259,17 @@ class PaperTradingOrchestrator:
             entry_fee = pos_size * 0.001
             stop_price = risk.stop_loss_price or (entry_price * 0.997)
             pos = self.account.open_position(
-                sym, "long", entry_price, quantity,
-                fees=entry_fee, stop_loss_price=stop_price,
-                strategy_id=opp.signal.strategy_id)
+                sym,
+                "long",
+                entry_price,
+                quantity,
+                fees=entry_fee,
+                stop_loss_price=stop_price,
+                strategy_id=opp.signal.strategy_id,
+            )
             if pos:
                 self.monitor.register_position(pos)
-                self.analytics.record_allocation(
-                    sym, opp.signal.strategy_id, "binance", pos_size)
+                self.analytics.record_allocation(sym, opp.signal.strategy_id, "binance", pos_size)
         self._total_scans += 1
 
     async def _scan_loop(self) -> None:
@@ -267,10 +286,14 @@ class PaperTradingOrchestrator:
             await asyncio.sleep(self._report_interval)
             s = self.account.state
             elapsed = time.monotonic() - self._start_time
-            logger.info("paper_status",
-                         equity=round(s.equity, 0), pnl=round(s.realized_pnl, 0),
-                         positions=len(s.open_positions), trades=s.trade_count,
-                         elapsed=round(elapsed, 0))
+            logger.info(
+                "paper_status",
+                equity=round(s.equity, 0),
+                pnl=round(s.realized_pnl, 0),
+                positions=len(s.open_positions),
+                trades=s.trade_count,
+                elapsed=round(elapsed, 0),
+            )
 
     def _final_report(self) -> dict[str, Any]:
         s = self.account.state
@@ -283,9 +306,11 @@ class PaperTradingOrchestrator:
             "total_fees": round(s.total_fees, 4),
             "total_slippage": round(s.total_slippage, 4),
             "total_trades": s.trade_count,
-            "wins": s.win_count, "losses": s.loss_count,
+            "wins": s.win_count,
+            "losses": s.loss_count,
             "win_rate": s.win_count / s.trade_count if s.trade_count > 0 else 0,
             "total_signals": self._total_signals,
             "total_scans": self._total_scans,
-            "mode": "PAPER", "live_trading": "DISABLED",
+            "mode": "PAPER",
+            "live_trading": "DISABLED",
         }

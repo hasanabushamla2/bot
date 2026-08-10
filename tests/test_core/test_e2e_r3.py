@@ -103,14 +103,18 @@ class TestMicroLiveR3:
                 "limits": {"cost": {"min": 0.01}, "amount": {"min": 0.00001}},
             }
         }
-        await orch._tick(["BTC/USDT"], 0)
+        # Manual setup — skip real network connect
+        orch._running = True
+        result = await orch.process_market_event("BTC/USDT", bid=49990, ask=50010, last=50000)
+        assert result is not None
+        assert result.get("side") == "buy"
         assert len(orch._execution_log) >= 1
-        entry = [e for e in orch._execution_log if e.get("side") == "buy"]
-        exit_ = [e for e in orch._execution_log if e.get("side") == "sell"]
-        assert len(entry) > 0
-        assert len(exit_) > 0
+        assert len(orch._execution_log) >= 1
+        exit_result = await orch.process_exit("BTC/USDT", 50200, reason="signal")
+        assert exit_result is not None
         s = orch.account.summary()
         assert s["capital_cap"] == 50
+        await orch.stop()
 
     def test_cap_atomic(self) -> None:
         acct = MicroLiveAccount(capital_cap=50, slot_size=5, max_slots=10)
