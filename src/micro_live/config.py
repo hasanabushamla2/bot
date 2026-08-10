@@ -1,4 +1,4 @@
-"""Micro-Live Configuration — F-06 fixed: env_prefix generates correct env var names."""
+"""N-04/F-06: Mode must be part of arming. MODE=micro_live required."""
 
 from __future__ import annotations
 
@@ -23,24 +23,19 @@ class MicroLivePolicy:
     stop_slippage_critical_pct: float = 0.50
     latency_warn_ms: float = 500.0
     latency_critical_ms: float = 2000.0
-    max_consecutive_rejections: int = 5
-    balance_mismatch_action: str = "halt"
 
 
 class MicroLiveSettings(BaseSettings):
-    """F-06: env_prefix='MICRO_LIVE_' → MICRO_LIVE_ENABLED, MICRO_LIVE_ACKNOWLEDGED, MICRO_LIVE_DRY_RUN.
-    Fields are named without alias — the env_prefix handles the prefix."""
-
     model_config = SettingsConfigDict(env_prefix="MICRO_LIVE_", extra="ignore")
-
     enabled: bool = False
     acknowledged: bool = False
     dry_run: bool = True
-    mode: str = "micro_live"
+    mode: str = "paper"
 
     @property
     def is_fully_armed(self) -> bool:
-        return self.enabled and self.acknowledged and not self.dry_run
+        """N-04: mode must be 'micro_live' plus all 3 gates."""
+        return self.mode == "micro_live" and self.enabled and self.acknowledged and not self.dry_run
 
     @property
     def can_place_real_orders(self) -> bool:

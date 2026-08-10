@@ -359,7 +359,9 @@ class GlobalScanner:
         )
 
         signal.confidence = signal.composite_score * (0.5 + 0.5 * signal.liquidity_score)
-        signal.estimated_net_edge_bps = signal.composite_score * 50.0
+        signal.estimated_net_edge_bps = (
+            0.0  # N-24: signal_strength_score — real edge requires model/history
+        )
 
         reasons = []
         if signal.momentum_score > 0.7:
@@ -470,8 +472,8 @@ class GlobalScanner:
             market=snap.asset_class.value,
             direction=direction,
             confidence=scanner_signal.confidence,
-            estimated_return=snap.price_change_5m_pct,
-            estimated_risk=abs(snap.price_change_5m_pct) * 0.5,
+            estimated_return=snap.price_change_5m_pct / 100.0,
+            estimated_risk=abs(snap.price_change_5m_pct) * 0.5 / 100.0,
             required_capital=None,
             entry_logic={
                 "scanner": "global_scanner",

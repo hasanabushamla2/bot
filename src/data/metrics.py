@@ -164,7 +164,9 @@ class MetricsCollector:
             n = len(sorted_lat)
             m.latency_exchange_to_local_p50_ms = sorted_lat[n // 2]
             m.latency_exchange_to_local_p95_ms = sorted_lat[
-                int(n * 0.95) if int(n * 0.95) < n else n - 1
+                max(0, min(n - 1, int(n * 0.95 + 0.5)))
+                if max(0, min(n - 1, int(n * 0.95 + 0.5))) < n
+                else n - 1
             ]
             m.latency_exchange_to_local_p99_ms = sorted_lat[int(n * 0.99)]
             m.latency_exchange_to_local_max_ms = sorted_lat[-1]

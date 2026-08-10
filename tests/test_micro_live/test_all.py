@@ -27,7 +27,7 @@ class TestMicroLiveSettings:
         assert s.dry_run is True
 
     def test_all_gates_required(self) -> None:
-        s = MicroLiveSettings(enabled=True, acknowledged=True, dry_run=False)
+        s = MicroLiveSettings(enabled=True, acknowledged=True, dry_run=False, mode="micro_live")
         assert s.is_fully_armed
         assert s.can_place_real_orders
 
@@ -234,4 +234,4 @@ class TestNetPnlCalculation:
         p = acct.open_position("PNL-USDT", 100.0, 0.1, entry_fee=0.01)
         acct.close_position(p.position_id, 105.0, exit_fee=0.0105)
         r = acct.daily_report()
-        assert r["total_fees_paid"] >= 0
+        assert r["total_fees"] >= 0

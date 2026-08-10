@@ -18,6 +18,7 @@ from src.data.normalization import CanonicalSymbol
 from src.features.engine import FeatureEngine
 from src.opportunity.engine import OpportunityEngine
 from src.paper.account import PaperAccount
+from src.paper.engine import PaperExecutionEngine
 from src.paper.position_monitor import PositionMonitor
 from src.portfolio.allocator import CapitalAllocator
 from src.portfolio.capital_tiers import CapitalTierManager
@@ -63,6 +64,7 @@ class PaperTradingOrchestrator:
         self.allocator = CapitalAllocator()
         self.liquidity = LiquidityAnalyzer()
         self.account = PaperAccount(initial_balance=initial_balance)
+        self.paper_exec = PaperExecutionEngine()
         self.monitor = PositionMonitor(self.account)
         self.analytics = AnalyticsTracker()
         self._running = False

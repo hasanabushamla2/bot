@@ -44,7 +44,7 @@ class BreakoutStrategy(BaseStrategy):
             symbol=features.symbol,
             direction=direction,
             confidence=score,
-            estimated_return=features.momentum_1m,
+            estimated_return=features.momentum_1m / 100.0,
             estimated_risk=features.volatility_5m_pct,
             timestamp=datetime.now(UTC),
             signal_expires_at=datetime.now(UTC) + timedelta(seconds=30),

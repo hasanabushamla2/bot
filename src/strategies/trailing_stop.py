@@ -53,7 +53,7 @@ class TrailConfig:
 
     # Never set a fixed ceiling
     enable_fixed_take_profit: bool = False  # MUST be False per policy
-    trailing_delta: float = 0.002     # Retracement fraction (0.002 = 0.20%)
+    trailing_delta: float = 0.002  # Retracement fraction (0.002 = 0.20%)
 
 
 @dataclass

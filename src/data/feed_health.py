@@ -156,7 +156,11 @@ class FeedHealthMonitor:
                     sorted_w = sorted(window)
                     n = len(sorted_w)
                     fh.latency_p50_ms = sorted_w[n // 2]
-                    fh.latency_p95_ms = sorted_w[int(n * 0.95) if int(n * 0.95) < n else n - 1]
+                    fh.latency_p95_ms = sorted_w[
+                        max(0, min(n - 1, int(n * 0.95 + 0.5)))
+                        if max(0, min(n - 1, int(n * 0.95 + 0.5))) < n
+                        else n - 1
+                    ]
                     fh.latency_p99_ms = sorted_w[int(n * 0.99)]
 
             # --- Clock offset ---

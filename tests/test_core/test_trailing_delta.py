@@ -1,4 +1,5 @@
 """Trailing Stop tests — FINAL: trailing_delta = 0.002 (0.20%)."""
+
 from __future__ import annotations
 
 import pytest
@@ -126,9 +127,7 @@ class TestTrailingDelta:
     def test_J_position_monitor_integration(self) -> None:
         """PositionMonitor → trail activation + exit at 0.20%."""
         acct = PaperAccount(10000)
-        acct.open_position(
-            "J-USD", "long", 100.0, 1.0, fees=0.1, stop_loss_price=99.70
-        )
+        acct.open_position("J-USD", "long", 100.0, 1.0, fees=0.1, stop_loss_price=99.70)
         pos = acct.state.open_positions["J-USD"]
         cfg = TrailConfig(
             trail_pct=0.20,

@@ -105,6 +105,10 @@ class PaperAccount:
         opportunity_id: str = "",
     ) -> PaperPosition | None:
         notional = entry_price * quantity
+        # N-12: Reject duplicate same-symbol position
+        if symbol in self.state.open_positions:
+            logger.warning("paper_duplicate_blocked", symbol=symbol)
+            return None
         cost = notional + fees
         if cost > self.state.cash:
             logger.warning("paper_insufficient_cash", needed=cost, available=self.state.cash)

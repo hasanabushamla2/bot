@@ -96,7 +96,12 @@ class TestPositionMonitor:
 
     def test_trailing_activation_and_exit(self) -> None:
         acct = PaperAccount(10000)
-        cfg = TrailConfig(trail_pct=0.20, activation_pct=0.20, trailing_delta=0.002, enable_fixed_take_profit=False)
+        cfg = TrailConfig(
+            trail_pct=0.20,
+            activation_pct=0.20,
+            trailing_delta=0.002,
+            enable_fixed_take_profit=False,
+        )
         acct.open_position("BTC-USDT", "long", 50000, 0.1)
         pos = acct.state.open_positions["BTC-USDT"]
         monitor = PositionMonitor(acct, trail_config=cfg)
@@ -312,8 +317,8 @@ class TestEndToEndPipeline:
         # Opening same symbol again should fail (already in dict)
         # Actually our implementation replaces — that's fine for paper
         p2 = acct.open_position("BTC-USDT", "long", 51000, 0.1)
-        # Should not open duplicate — key collision means the old one is overwritten
-        assert p2 is not None
+        # Duplicate same-symbol is now rejected
+        assert p2 is None
 
     def test_daily_report_generation(self) -> None:
         from src.portfolio.capital_tiers import CapitalTierManager, generate_daily_report
