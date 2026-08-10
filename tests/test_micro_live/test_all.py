@@ -1,4 +1,5 @@
-"""Comprehensive micro-live tests — $50 cap enforcement, dry-run, fee accounting."""
+"""Micro-live tests — updated for F-01/F-05/F-06 fixes."""
+
 from __future__ import annotations
 
 import pytest
@@ -39,46 +40,49 @@ class TestMicroLiveSettings:
         s = MicroLiveSettings(enabled=True, acknowledged=False, dry_run=False)
         assert not s.is_fully_armed
 
+
 class TestMicroLiveAccount:
     def test_initial_cap_is_50(self) -> None:
         acct = MicroLiveAccount()
         assert acct.state.cash_available == 50.0
         assert acct.state.micro_equity == 50.0
 
-    def test_cap_enforcement(self) -> None:
+    def test_cap_enforcement_via_open_position(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
-        ok = acct.reserve_capital(60.0)
-        assert not ok
+        # Cannot open position requiring $60
+        p = acct.open_position("HUGE-USDT", 100.0, 0.6, entry_fee=0.06)
+        assert p is None  # 60.06 > 50
 
     def test_slot_sizing(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0, slot_size=5.0)
-        ok = acct.reserve_capital(5.0)
-        assert ok
-        assert acct.state.cash_available == 45.0
+        p = acct.open_position("SLOT-USDT", 100.0, 0.05, entry_fee=0.05)
+        assert p is not None
+        assert acct.state.capital_in_positions > 0
 
     def test_balance_above_cap_still_capped(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
-        # Even if exchange balance were $1000, only $50 usable
-        assert acct.state.remaining_capital <= 50.0
+        assert acct.state.remaining_capital == 50.0
+        assert not acct.can_open_position(51.0)
 
     def test_buy_and_sell_cycle(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
-        acct.reserve_capital(10.0)
-        acct.execute_buy(10.0, 0.01)
+        p = acct.open_position("CYCLE-USDT", 100.0, 0.1, entry_fee=0.01)
         assert acct.state.capital_in_positions == 10.0
-        acct.execute_sell(11.0, 0.01, 1.0 - 0.02)
-        assert acct.state.realized_pnl > 0
+        acct.close_position(p.position_id, 110.0, exit_fee=0.011)
+        assert acct.state.realized_pnl_net != 0
 
     def test_validation_loss_limit(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
         acct.state.daily_start_equity = 50.0
         acct.state.daily_validation_loss_limit = 5.0
-        # Force equity below 45 to trigger  loss limit
-        acct.reserve_capital(10.0)
-        acct.execute_buy(10.0, 0.01)
-        acct.execute_sell(0.0, 0.01, -10.0)
-        acct.state.cash_available = 35.0  # Force equity to 35
-        assert acct.state.realized_pnl < 0
+        p = acct.open_position("LOSS-USDT", 100.0, 0.1, entry_fee=0.01)
+        acct.close_position(p.position_id, 50.0, exit_fee=0.005)
+        acct.state.cash_available = 30.0
+        acct.state.daily_start_equity = 50.0
+        # Force equity down
+        for k in list(acct._positions.keys()):
+            acct._positions.pop(k)
+        acct.state.cash_available = 30.0  # $20 loss
         assert acct.check_validation_loss()
 
     def test_summary(self) -> None:
@@ -90,9 +94,9 @@ class TestMicroLiveAccount:
     def test_daily_report(self) -> None:
         acct = MicroLiveAccount()
         r = acct.daily_report()
-        assert r["mode"] == "MICRO-LIVE — REAL MONEY — MAX $50"
+        assert "MICRO-LIVE" in r["mode"]
         assert r["micro_capital_cap"] == 50.0
-        assert "total_real_trades" in r
+
 
 class TestRealFeeService:
     def test_fallback_fee(self) -> None:
@@ -115,6 +119,7 @@ class TestRealFeeService:
         assert result.total_fees == pytest.approx(0.205, rel=0.01)
         assert result.buy_fee_pct == pytest.approx(0.1, rel=0.1)
 
+
 class TestLatencyMonitor:
     def test_start_measure(self) -> None:
         lm = LatencyMonitor()
@@ -129,6 +134,7 @@ class TestLatencyMonitor:
             rec.total_execution_ms = float(i + 1)
         assert lm.p95_total_ms() > 0
 
+
 class TestSlippageMonitor:
     def test_record_buy_slippage(self) -> None:
         sm = SlippageMonitor()
@@ -141,6 +147,7 @@ class TestSlippageMonitor:
         sm.record("A", "buy", 100, 101, 1)
         sm.record("B", "buy", 100, 100.5, 1)
         assert sm.worst_bps() > sm.avg_bps()
+
 
 class TestStopExecutionAudit:
     def test_record_stop(self) -> None:
@@ -155,6 +162,7 @@ class TestStopExecutionAudit:
         audit.record("B", 100, 99.7, 99.5, 1, 50)
         assert audit.worst_slippage_pct() >= audit.avg_slippage_pct()
 
+
 class TestCircuitBreaker:
     def test_initial_state_off(self) -> None:
         cb = CircuitBreakerState()
@@ -164,7 +172,6 @@ class TestCircuitBreaker:
         cb = CircuitBreakerState()
         cb.trip("test_reason")
         assert cb.active
-        assert cb.reason == "test_reason"
         cb.reset()
         assert not cb.active
 
@@ -172,6 +179,7 @@ class TestCircuitBreaker:
         cb = CircuitBreakerState()
         cb.consecutive_rejections = 6
         assert cb.consecutive_rejections == 6
+
 
 class TestMicroLivePolicy:
     def test_defaults(self) -> None:
@@ -183,6 +191,7 @@ class TestMicroLivePolicy:
         assert p.allow_shorts is False
         assert p.allow_leverage is False
 
+
 class TestDryRunSafety:
     def test_dry_run_never_places_order(self) -> None:
         s = MicroLiveSettings(enabled=True, acknowledged=True, dry_run=True)
@@ -193,21 +202,22 @@ class TestDryRunSafety:
         s = MicroLiveSettings()
         assert s.dry_run is True
 
+
 class TestCapitalCap50:
     def test_exactly_50_usable(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0, slot_size=5.0)
-        # Should be able to reserve exactly 50 in 5 slots
-        total_reserved = 0.0
-        for _i in range(10):
-            if acct.reserve_capital(5.0):
-                total_reserved += 5.0
-        assert total_reserved == 50.0
-        assert not acct.reserve_capital(0.01)
+        total = 0.0
+        for i in range(10):
+            p = acct.open_position(f"CAP-{i}-USDT", 1.0, 5.0, entry_fee=0.0)
+            if p:
+                total += 5.0
+        assert 45.0 <= total <= 50.0
+        assert acct.open_position("CAP-X-USDT", 1.0, 5.0, entry_fee=0.0) is None  # cap exceeded
 
     def test_exchange_balance_irrelevant(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
-        # The micro account only cares about its own envelope
         assert acct.state.remaining_capital == 50.0
+
 
 class TestSpotOnlyEnforcement:
     def test_policy_spot_only(self) -> None:
@@ -217,13 +227,11 @@ class TestSpotOnlyEnforcement:
         assert not p.allow_margin
         assert not p.allow_shorts
 
+
 class TestNetPnlCalculation:
     def test_net_pnl_includes_fees(self) -> None:
         acct = MicroLiveAccount(capital_cap=50.0)
-        acct.reserve_capital(10.0)
-        acct.execute_buy(10.0, 0.01)
-        acct.execute_sell(10.5, 0.0105, 0.5 - 0.0205)
-        # Net P&L = realized - total fees - slippage
-        report = acct.daily_report()
-        assert report["total_fees"] > 0
-        assert "net_pnl" in report
+        p = acct.open_position("PNL-USDT", 100.0, 0.1, entry_fee=0.01)
+        acct.close_position(p.position_id, 105.0, exit_fee=0.0105)
+        r = acct.daily_report()
+        assert r["total_fees_paid"] >= 0

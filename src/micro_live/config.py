@@ -1,17 +1,9 @@
-"""Micro-Live Configuration — safety-gated mode for real-money validation.
+"""Micro-Live Configuration — F-06 fixed: env_prefix generates correct env var names."""
 
-THREE safety gates must ALL be tripped before any real order:
-  MODE=micro_live
-  MICRO_LIVE_ENABLED=true
-  MICRO_LIVE_ACKNOWLEDGED=true
-
-MAXIMUM CAPITAL: $50 USD. SPOT ONLY. No withdrawals.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,20 +26,21 @@ class MicroLivePolicy:
     max_consecutive_rejections: int = 5
     balance_mismatch_action: str = "halt"
 
+
 class MicroLiveSettings(BaseSettings):
+    """F-06: env_prefix='MICRO_LIVE_' → MICRO_LIVE_ENABLED, MICRO_LIVE_ACKNOWLEDGED, MICRO_LIVE_DRY_RUN.
+    Fields are named without alias — the env_prefix handles the prefix."""
+
     model_config = SettingsConfigDict(env_prefix="MICRO_LIVE_", extra="ignore")
-    enabled: bool = Field(default=False, alias="ENABLED")
-    acknowledged: bool = Field(default=False, alias="ACKNOWLEDGED")
-    dry_run: bool = Field(default=True, alias="DRY_RUN")
-    mode: str = Field(default="micro_live", alias="MODE")
+
+    enabled: bool = False
+    acknowledged: bool = False
+    dry_run: bool = True
+    mode: str = "micro_live"
 
     @property
     def is_fully_armed(self) -> bool:
-        return (
-            self.enabled
-            and self.acknowledged
-            and not self.dry_run
-        )
+        return self.enabled and self.acknowledged and not self.dry_run
 
     @property
     def can_place_real_orders(self) -> bool:
@@ -56,3 +49,12 @@ class MicroLiveSettings(BaseSettings):
     @property
     def is_dry_run(self) -> bool:
         return self.enabled and self.dry_run
+
+    def gate_status(self) -> dict:
+        return {
+            "MODE": self.mode,
+            "MICRO_LIVE_ENABLED": self.enabled,
+            "MICRO_LIVE_ACKNOWLEDGED": self.acknowledged,
+            "MICRO_LIVE_DRY_RUN": self.dry_run,
+            "REAL_ORDER_ALLOWED": self.can_place_real_orders,
+        }

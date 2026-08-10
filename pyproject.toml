@@ -96,6 +96,7 @@ ignore = [
     "SIM108", # ternary sometimes less readable
     "B027",  # empty methods in ABC are intentional hooks
     "E402",  # import-at-top — allowed for circular-import workarounds
+    "N801",  # class name convention — TestF01_ prefix intentional
 ]
 
 [tool.ruff.lint.isort]

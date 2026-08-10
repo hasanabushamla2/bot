@@ -56,8 +56,8 @@ class AllocatorConfig:
     diversification_bonus: float = 0.05  # Score bonus for uncorrelated additions
 
     # Sizing
-    sizing_method: str = "kelly_fractional"  # "kelly_fractional", "equal_risk", "score_weighted"
-    kelly_fraction: float = 0.25  # Fraction of full Kelly to use
+    sizing_method: str = "risk_budget"  # "risk_budget", "equal_risk", "score_weighted"
+    risk_budget_fraction: float = 0.25  # Fraction of full Risk-Budget to use
     min_position_size_usd: float = 50.0  # Don't allocate less than this
 
     # Rebalancing
@@ -411,14 +411,16 @@ class CapitalAllocator:
             return self._size_equal_risk(dec, portfolio)
         elif self.config.sizing_method == "score_weighted":
             return self._size_score_weighted(dec, available)
-        else:  # kelly_fractional (default)
-            return self._size_kelly_fractional(dec, portfolio)
+        else:  # risk_budget_fractional (default)
+            return self._size_risk_budget_fractional(dec, portfolio)
 
-    def _size_kelly_fractional(self, dec: AllocationDecision, portfolio: PortfolioState) -> float:
-        """Fractional Kelly position sizing.
+    def _size_risk_budget_fractional(
+        self, dec: AllocationDecision, portfolio: PortfolioState
+    ) -> float:
+        """Fractional Risk-Budget position sizing.
 
-        Kelly fraction f* = edge / variance_estimate
-        We use a conservative fraction of full Kelly.
+        Risk-Budget fraction f* = edge / variance_estimate
+        We use a conservative fraction of full Risk-Budget.
 
         For trading: approximated as win_rate - (loss_rate / win_loss_ratio)
         """
@@ -427,19 +429,19 @@ class CapitalAllocator:
         # Base: max single position as fraction of equity
         base_size = equity * self.config.max_single_position_pct / 100.0
 
-        # Apply Kelly fraction
-        kelly_size = base_size * self.config.kelly_fraction
+        # Apply Risk-Budget fraction
+        risk_budget_size = base_size * self.config.risk_budget_fraction
 
         # Cap by max efficient size from liquidity
         if dec.max_efficient_size > 0:
-            kelly_size = min(kelly_size, dec.max_efficient_size)
+            risk_budget_size = min(risk_budget_size, dec.max_efficient_size)
 
         # Cap by requested capital (don't allocate more than needed)
         if dec.requested_capital > 0:
-            kelly_size = min(kelly_size, dec.requested_capital)
+            risk_budget_size = min(risk_budget_size, dec.requested_capital)
 
         # Floor
-        return max(0.0, kelly_size)
+        return max(0.0, risk_budget_size)
 
     def _size_equal_risk(self, dec: AllocationDecision, portfolio: PortfolioState) -> float:
         """Equal risk contribution sizing — divide risk budget equally."""

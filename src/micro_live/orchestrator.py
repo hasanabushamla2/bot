@@ -1,4 +1,5 @@
 """Micro-Live Orchestrator — $50 real-money validation loop (SPOT ONLY)."""
+
 from __future__ import annotations
 
 import json
@@ -22,13 +23,23 @@ from src.risk.engine import RiskEngine
 
 logger = get_logger(__name__)
 
+
 class MicroLiveOrchestrator:
-    def __init__(self, settings: MicroLiveSettings, policy: MicroLivePolicy | None = None, exchange_id: str = "binance") -> None:
+    def __init__(
+        self,
+        settings: MicroLiveSettings,
+        policy: MicroLivePolicy | None = None,
+        exchange_id: str = "binance",
+    ) -> None:
         self.settings = settings
         self.policy = policy or MicroLivePolicy()
         self.exchange_id = exchange_id
         self.adapter = MicroLiveAdapter(settings, self.policy, exchange_id)
-        self.account = MicroLiveAccount(capital_cap=self.policy.capital_cap_usd, slot_size=self.policy.default_slot_size_usd, max_slots=self.policy.max_slots)
+        self.account = MicroLiveAccount(
+            capital_cap=self.policy.capital_cap_usd,
+            slot_size=self.policy.default_slot_size_usd,
+            max_slots=self.policy.max_slots,
+        )
         self.fees = RealFeeService()
         self.latency = LatencyMonitor()
         self.slippage = SlippageMonitor()
@@ -44,9 +55,16 @@ class MicroLiveOrchestrator:
         self._api_key = api_key
         self._api_secret = api_secret
 
-    async def start(self, symbols: list[str] | None = None, duration_seconds: float = 0.0) -> dict[str, Any]:
+    async def start(
+        self, symbols: list[str] | None = None, duration_seconds: float = 0.0
+    ) -> dict[str, Any]:
         symbols = symbols or ["BTC/USDT", "ETH/USDT"]
-        logger.info("micro_live_starting", dry_run=self.adapter.is_dry_run, cap=self.policy.capital_cap_usd, symbols=symbols)
+        logger.info(
+            "micro_live_starting",
+            dry_run=self.adapter.is_dry_run,
+            cap=self.policy.capital_cap_usd,
+            symbols=symbols,
+        )
         connected = await self.adapter.connect(self._api_key, self._api_secret)
         if not connected:
             return {"status": "error", "reason": "CONNECTION_FAILED"}
@@ -54,7 +72,9 @@ class MicroLiveOrchestrator:
         for sym in symbols:
             validation = self.adapter.validate_market(sym)
             if not validation["valid"]:
-                logger.warning("market_rejected_micro_live", symbol=sym, reason=validation["reason"])
+                logger.warning(
+                    "market_rejected_micro_live", symbol=sym, reason=validation["reason"]
+                )
         # Check withdrawal permissions
         if self.adapter.check_withdrawal_permission():
             logger.warning("WITHDRAWAL_PERMISSION_DETECTED")
@@ -98,6 +118,7 @@ class MicroLiveOrchestrator:
 
     async def _sleep(self, seconds: float) -> None:
         import asyncio
+
         await asyncio.sleep(seconds)
 
     def simulate_entry(self, symbol: str, entry_price: float, quantity: float) -> dict[str, Any]:
@@ -112,11 +133,25 @@ class MicroLiveOrchestrator:
         self.slippage.record(symbol, "buy", entry_price, entry_price * 1.0005, quantity)
         self.account.reserve_capital(notional)
         self.account.execute_buy(notional, fee)
-        result = {"symbol": symbol, "side": "buy", "notional": notional, "fee": fee, "price": entry_price, "quantity": quantity}
+        result = {
+            "symbol": symbol,
+            "side": "buy",
+            "notional": notional,
+            "fee": fee,
+            "price": entry_price,
+            "quantity": quantity,
+        }
         self._execution_log.append(result)
         return result
 
-    def simulate_exit(self, symbol: str, exit_price: float, entry_price: float, quantity: float, reason: str = "signal") -> dict[str, Any]:
+    def simulate_exit(
+        self,
+        symbol: str,
+        exit_price: float,
+        entry_price: float,
+        quantity: float,
+        reason: str = "signal",
+    ) -> dict[str, Any]:
         """Simulate a micro-live exit."""
         entry_notional = entry_price * quantity
         exit_notional = exit_price * quantity
@@ -131,7 +166,14 @@ class MicroLiveOrchestrator:
             self.account.state.hard_stop_exits += 1
         elif reason == "trail_hit":
             self.account.state.trail_exits += 1
-        result = {"symbol": symbol, "side": "sell", "exit_notional": exit_notional, "fee": fee, "pnl": pnl, "reason": reason}
+        result = {
+            "symbol": symbol,
+            "side": "sell",
+            "exit_notional": exit_notional,
+            "fee": fee,
+            "pnl": pnl,
+            "reason": reason,
+        }
         self._execution_log.append(result)
         return result
 
