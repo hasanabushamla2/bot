@@ -249,8 +249,9 @@ class PaperTradingOrchestrator:
             if entry_price <= 0:
                 try:
                     raw = next(r for r, c in self._raw_to_canonical.items() if c == sym)
-                    t = await self.adapter.get_ticker  # type: ignore[union-attr](raw)
-                    entry_price = t.last if t and t.last > 0 else 0
+                    if self.adapter is not None:
+                        t = await self.adapter.get_ticker(raw)
+                        entry_price = t.last if t and t.last > 0 else 0
                 except Exception:
                     continue
             if entry_price <= 0:
