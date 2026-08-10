@@ -1,0 +1,112 @@
+# Paper Trading
+
+## Quant Opportunity Engine — Paper Trading System
+
+---
+
+## 1. Design Principle
+
+**Paper trading uses the SAME code paths as live trading.**
+
+There is no simplified "paper-only" fast path. The same:
+- Strategy plugins
+- Opportunity Engine
+- Risk Engine
+- Execution interface (with simulated fills)
+- Order lifecycle state machine
+- Analytics tracking
+
+...operate in both paper and live mode. The ONLY difference is that paper mode simulates fills against live market data instead of sending orders to an exchange.
+
+---
+
+## 2. Why This Matters
+
+Most trading systems create a separate paper trading implementation that:
+- Fills every order instantly at the mid-price.
+- Ignore slippage.
+- Ignore partial fills.
+- Have unrealistic latency.
+
+This produces paper results that look great but have zero predictive value for live performance. **We reject this approach.**
+
+---
+
+## 3. Paper Execution Engine
+
+### 3.1 Fill Simulation
+
+- **Market orders**: Fill at current bid (sells) or ask (buys) with configurable slippage.
+- **Limit orders**: Fill only if limit price crosses the spread. Otherwise remain OPEN.
+- **Rejected orders**: Reject if price is stale, balance insufficient, or market data missing.
+
+### 3.2 Cost Simulation
+
+- **Fees**: Taker fee applied to every fill (default 0.1%).
+- **Slippage**: Configurable slippage in basis points (default 5 bps).
+- **Latency**: Configurable simulated latency (default 50ms).
+
+### 3.3 Paper Account
+
+The paper account starts with a configurable balance and tracks:
+- Balance (available + reserved).
+- Realized P&L.
+- Total fees paid.
+- Equity curve.
+
+---
+
+## 4. Running Paper Trading
+
+```bash
+# Start full paper trading system
+make run-paper
+
+# Or with Docker
+docker compose up -d
+```
+
+The system will:
+1. Connect to configured exchanges (WebSocket + REST).
+2. Subscribe to configured symbols.
+3. Run all enabled strategy plugins.
+4. Score and rank opportunities.
+5. Pass approved opportunities through the risk engine.
+6. Simulate order execution.
+7. Track all metrics.
+8. Serve the dashboard at http://localhost:8080.
+
+---
+
+## 5. Paper Mode Safety
+
+Paper mode:
+- NEVER sends orders to any exchange.
+- NEVER requires real API keys (can run with mock data).
+- Is clearly labeled on the dashboard with a green "PAPER MODE" badge.
+- Cannot be confused with live mode.
+
+---
+
+## 6. Transitioning to Live
+
+Before enabling live trading:
+1. Run paper trading for a statistically significant period (weeks, not hours).
+2. Verify strategy performance aligns with backtest results.
+3. Verify fill rates, slippage estimates, and fee calculations.
+4. Complete the security checklist in SECURITY.md.
+5. Set `MODE=live` AND `LIVE_TRADING_ENABLED=true`.
+6. Start with minimal position sizes.
+7. Monitor closely for the first 24 hours.
+
+---
+
+## 7. Paper Trading Metrics
+
+Same metrics as live trading:
+- Win rate, P&L, Sharpe, Sortino, drawdown.
+- Fill ratio, rejection rate.
+- Latency measurements.
+- Strategy/market/exchange breakdowns.
+
+If paper results differ significantly from backtest results, investigate before going live.

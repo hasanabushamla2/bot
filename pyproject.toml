@@ -1,0 +1,169 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-opportunity-engine"
+version = "0.1.0"
+description = "Multi-Market / Multi-Strategy Quant Opportunity Engine"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Bot Developer"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+dependencies = [
+    "asyncpg>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.14",
+    "redis>=5.2",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "websockets>=14.1",
+    "structlog>=25.1",
+    "pyyaml>=6.0",
+    "numpy>=2.2",
+    "pandas>=2.2",
+    "scipy>=1.15",
+    "uvicorn>=0.34",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "tenacity>=9.0",
+    "orjson>=3.10",
+    "python-dateutil>=2.9",
+    "pyarrow>=19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "pytest-cov>=6.0",
+    "pytest-mock>=3.14",
+    "pytest-xdist>=3.6",
+    "hypothesis>=6.122",
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "pre-commit>=4.1",
+    "black>=25.1",
+    "isort>=6.0",
+    "coverage>=7.6",
+    "faker>=35.0",
+    "docker>=7.1",
+    "testcontainers>=4.9",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "migrations",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "T20", # flake8-print
+    "PT",  # flake8-pytest-style
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "UP042", # str+Enum intentional for SQLAlchemy compatibility
+    "SIM102", # nested if acceptable for readability
+    "SIM108", # ternary sometimes less readable
+    "B027",  # empty methods in ABC are intentional hooks
+    "E402",  # import-at-top — allowed for circular-import workarounds
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_any_generics = false
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_no_return = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "src"
+exclude = [
+    "migrations/",
+    "build/",
+    "dist/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "redis.*",
+    "orjson.*",
+    "pyarrow.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--disable-warnings",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+    "e2e: marks tests as end-to-end tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "migrations/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

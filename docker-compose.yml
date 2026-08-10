@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  # PostgreSQL — persistent event store & analytics
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot_password
+      POSTGRES_DB: bot_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d bot_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis — caching, pub/sub, rate-limit tracking
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Quant engine — always paper unless explicitly overridden
+  engine:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MODE: paper
+      LIVE_TRADING_ENABLED: "false"
+      DATABASE_URL: postgresql+asyncpg://bot:bot_password@postgres:5432/bot_db
+      DATABASE_URL_SYNC: postgresql://bot:bot_password@postgres:5432/bot_db
+      REDIS_URL: redis://redis:6379/0
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "8080"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+volumes:
+  pgdata:
+  redisdata:

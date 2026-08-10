@@ -1,0 +1,65 @@
+# Quant Opportunity Engine — Default Configuration
+# =================================================
+# Environment variables OVERRIDE these values.
+# This file defines safe defaults.
+
+# --- Mode (MUST be "paper" for safety) ---
+mode: paper
+live_trading_enabled: false
+
+# --- Database ---
+database:
+  pool_size: 20
+  pool_overflow: 10
+  echo: false
+
+# --- Risk (configurable, overridable per strategy) ---
+risk:
+  max_position_size_usd: 1000.0
+  max_total_exposure_usd: 10000.0
+  max_drawdown_pct: 10.0
+  default_stop_loss_pct: 0.3
+  max_leverage: 1.0
+  max_positions_per_strategy: 10
+  max_correlated_exposure_pct: 25.0
+  circuit_breaker_drawdown_pct: 15.0
+  circuit_breaker_consecutive_losses: 5
+
+# --- Opportunity Engine ---
+opportunity:
+  min_confidence: 0.5
+  min_net_return_pct: 0.05
+  min_fill_probability: 0.5
+  max_correlation: 0.7
+
+# --- Execution ---
+execution:
+  max_retries: 3
+  order_timeout_seconds: 30.0
+  simulated_latency_ms: 50.0  # Paper only
+
+# --- Backtesting ---
+backtesting:
+  maker_fee: 0.001
+  taker_fee: 0.001
+  slippage_bps: 5.0
+  latency_ms: 100.0
+  initial_capital: 10000.0
+  train_window_days: 90
+  test_window_days: 30
+
+# --- Data ---
+data:
+  stale_threshold_seconds: 10.0
+  reconnect_base_delay: 1.0
+  reconnect_max_delay: 30.0
+
+# --- Logging ---
+logging:
+  level: INFO
+  format: json  # "json" or "text"
+
+# --- Dashboard ---
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
