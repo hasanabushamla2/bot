@@ -205,6 +205,84 @@ class PaperAccount:
         )
         return trade
 
+    def reduce_position(
+        self,
+        symbol: str,
+        exit_price: float,
+        sell_qty: float,
+        fees: float = 0.0,
+        slippage: float = 0.0,
+        exit_reason: str = "partial",
+    ) -> ClosedTrade | None:
+        """Reduce position quantity without fully closing. BLOCKER 6 fix."""
+        pos = self.state.open_positions.get(symbol)
+        if pos is None:
+            return None
+        actual_sell = min(sell_qty, pos.quantity)
+        if actual_sell <= 0:
+            return None
+        exit_notional = exit_price * actual_sell
+        ratio = actual_sell / pos.quantity if pos.quantity > 0 else 1.0
+        # P&L for the sold portion
+        gross = (exit_price - pos.entry_price) * actual_sell
+        partial_fees = fees + (pos.fees_paid * ratio)
+        net = gross - partial_fees - slippage
+        # Update position
+        pos.quantity -= actual_sell
+        pos.notional = pos.entry_price * pos.quantity
+        pos.fees_paid *= 1.0 - ratio
+        # Update account
+        self.state.allocated -= pos.entry_price * actual_sell
+        self.state.cash += exit_notional - fees
+        self.state.total_fees += fees
+        self.state.total_slippage += slippage
+        self.state.realized_pnl += net
+        self.state.trade_count += 1
+        if net > 0:
+            self.state.win_count += 1
+        else:
+            self.state.loss_count += 1
+        return_pct = (net / (pos.entry_price * actual_sell) * 100) if pos.entry_price > 0 else 0.0
+        trade = ClosedTrade(
+            symbol=symbol,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            quantity=actual_sell,
+            gross_pnl=gross,
+            fees=partial_fees,
+            slippage_cost=slippage,
+            net_pnl=net,
+            return_pct=return_pct,
+            exit_reason=exit_reason,
+            target_stop=pos.stop_loss_price,
+            actual_exit=exit_price,
+            stop_slippage_pct=0.0,
+            entry_time=pos.entry_time,
+            exit_time=datetime.now(UTC),
+            strategy_id=pos.strategy_id,
+        )
+        self.state.closed_trades.append(trade)
+        # If fully closed, remove position
+        if pos.quantity <= 0:
+            del self.state.open_positions[symbol]
+        # Update drawdown
+        eq = self.state.equity
+        if eq > self.state.peak_equity:
+            self.state.peak_equity = eq
+        if self.state.peak_equity > 0:
+            dd = (self.state.peak_equity - eq) / self.state.peak_equity * 100
+            if dd > self.state.max_drawdown_pct:
+                self.state.max_drawdown_pct = dd
+        logger.info(
+            "paper_position_reduced",
+            symbol=symbol,
+            sold=round(actual_sell, 6),
+            remaining=round(pos.quantity, 6),
+            pnl=round(net, 4),
+        )
+        return trade
+
     def update_market_price(self, symbol: str, price: float) -> None:
         pos = self.state.open_positions.get(symbol)
         if pos is None:
