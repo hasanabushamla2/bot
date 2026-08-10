@@ -491,6 +491,7 @@ class GlobalScanner:
                 "no_fixed_take_profit": True,
             },
             metadata={
+                "entry_price": snap.last_price,
                 "asset_class": snap.asset_class.value,
                 "volume_24h": snap.volume_24h,
                 "spread_pct": snap.spread_pct,

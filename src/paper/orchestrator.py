@@ -352,7 +352,7 @@ class PaperTradingOrchestrator:
                 max_efficient_size=min(risk.max_position_size, self.account.state.cash * 0.2),
                 is_viable=True,
             )
-            decisions = self.allocator.allocate(pf_state, [(opp, risk, cap)])  # type: ignore[arg-type]
+            decisions = self.allocator.allocate(pf_state, [(opp, risk, cap)])
             if not decisions or not decisions[0].is_allocated:
                 continue
             pos_size = decisions[0].allocated_capital

@@ -58,6 +58,7 @@ class OrderFlowStrategy(BaseStrategy):
                 "no_fixed_take_profit": True,
             },
             metadata={
+                "entry_price": features.last_price,
                 "bid_ask_ratio": features.bid_ask_ratio,
                 "trade_flow_ratio": features.trade_flow_ratio,
                 "stop_loss_pct": 0.30,

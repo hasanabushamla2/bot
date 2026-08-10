@@ -56,6 +56,7 @@ class MomentumStrategy(BaseStrategy):
                 "no_fixed_take_profit": True,
             },
             metadata={
+                "entry_price": features.last_price,
                 "momentum_1m": features.momentum_1m,
                 "momentum_5m": features.momentum_5m,
                 "trend": features.trend_strength,

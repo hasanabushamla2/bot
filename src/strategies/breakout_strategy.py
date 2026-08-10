@@ -60,6 +60,7 @@ class BreakoutStrategy(BaseStrategy):
                 "no_fixed_take_profit": True,
             },
             metadata={
+                "entry_price": features.last_price,
                 "breakout_pct": features.breakout_position_pct,
                 "rel_volume": features.relative_volume,
                 "stop_loss_pct": 0.30,
