@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse, asyncio, sys, time, os, json
 from pathlib import Path
 from datetime import UTC, datetime
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: str = "replay"):
     from src.paper.orchestrator import PaperTradingOrchestrator

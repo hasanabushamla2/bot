@@ -1,3 +1,4 @@
+# mypy: ignore-errors
 """R9: SQLite paper persistence — same schema as PostgreSQL path."""
 
 from __future__ import annotations

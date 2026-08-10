@@ -189,6 +189,10 @@ class PaperAccount:
             strategy_id=pos.strategy_id,
         )
         self.state.closed_trades.append(trade)
+        # R11: Recompute unrealized PnL from remaining positions
+        self.state.unrealized_pnl = sum(
+            p.unrealized_pnl for p in self.state.open_positions.values()
+        )
         eq = self.state.equity
         if eq > self.state.peak_equity:
             self.state.peak_equity = eq
@@ -233,6 +237,7 @@ class PaperAccount:
         pos.fees_paid *= 1.0 - ratio
         # Update account
         self.state.allocated -= pos.entry_price * actual_sell
+        # R11: Recompute unrealized after reduction
         self.state.cash += exit_notional - fees
         self.state.total_fees += fees
         self.state.total_slippage += slippage
@@ -266,6 +271,10 @@ class PaperAccount:
         # If fully closed, remove position
         if pos.quantity <= 0:
             del self.state.open_positions[symbol]
+        # R11: Recompute unrealized PnL from remaining positions
+        self.state.unrealized_pnl = sum(
+            p.unrealized_pnl for p in self.state.open_positions.values()
+        )
         # Update drawdown
         eq = self.state.equity
         if eq > self.state.peak_equity:
