@@ -100,7 +100,8 @@ ignore = [
     "N801",  # class name convention — TestF01_ prefix intentional
     "N802",  # function name convention
     "PT018",  # assertion breakdown — test readability
-    "RUF015",  # single element slice — test readability — test_A_J identifiers intentional
+    "RUF015",  # single element slice — test readability
+    "RUF006",  # ensure_future task reference — test_A_J identifiers intentional
 ]
 
 [tool.ruff.lint.isort]
@@ -135,6 +136,19 @@ exclude = [
 ]
 
 
+
+
+[[tool.mypy.overrides]]
+module = ["ccxt", "ccxt.*", "ccxt.async_support", "ccxt.async_support.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yaml", "yaml.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "7.0"
