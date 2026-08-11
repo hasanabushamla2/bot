@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 from typing import Any
 
@@ -58,6 +59,9 @@ def setup_logging(
         level=log_level,
         force=True,
     )
+
+    # Ensure log directory exists before creating RotatingFileHandler
+    os.makedirs(log_dir, exist_ok=True)
 
     # Now add the rotating file handler (after basicConfig, so it's not cleared)
     root = logging.getLogger()

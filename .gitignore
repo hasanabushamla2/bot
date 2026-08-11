@@ -123,3 +123,5 @@ data/processed/*
 
 # OS
 Thumbs.db
+artifacts/
+data/*.db
