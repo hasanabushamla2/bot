@@ -26,7 +26,10 @@ async def main() -> None:
     args = parser.parse_args()
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
 
+    from src.core.logging_config import setup_logging
     from src.paper.orchestrator import PaperTradingOrchestrator
+
+    setup_logging(level=args.log_level, fmt="json", log_dir="logs")
 
     orch = PaperTradingOrchestrator(
         symbols=symbols,
