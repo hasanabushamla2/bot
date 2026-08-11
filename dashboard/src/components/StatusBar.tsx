@@ -26,6 +26,7 @@ export function StatusBar() {
   }, []);
 
   const ok = health?.engine_running && health?.status === "healthy";
+  const dbOk = health?.database?.exists === true;
 
   return (
     <div className="h-9 flex items-center gap-6 px-6 border-b border-border bg-card/50 text-xs shrink-0">
@@ -55,7 +56,7 @@ export function StatusBar() {
       <div className="ml-auto flex items-center gap-2">
         <Database className="w-3 h-3 text-muted-foreground" />
         <span className="text-muted-foreground">
-          {health?.db_exists ? "DB Connected" : "DB Offline"}
+          {health?.database?.exists ? "DB Online" : health ? "DB Offline" : "..."}
         </span>
       </div>
     </div>
