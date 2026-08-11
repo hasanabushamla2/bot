@@ -44,7 +44,7 @@ class MomentumStrategy(BaseStrategy):
             symbol=features.symbol,
             direction=direction,
             confidence=momentum_score,
-            estimated_return=features.momentum_5m / 100.0,
+            estimated_return=features.trend_strength * 0.03,
             estimated_risk=features.volatility_5m_pct,
             timestamp=datetime.now(UTC),
             signal_expires_at=datetime.now(UTC) + timedelta(seconds=30),
