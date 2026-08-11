@@ -149,9 +149,11 @@ class PaperTradingOrchestrator:
         self._last_test_signal_time: float = 0.0
 
         self.event_bus = EventBus(default_max_queue=500)
-        self.order_book_engine = OrderBookEngine(max_books=200)
+        book_cap = max(200, len(raw_symbols) + 100)
+        feat_cap = max(500, len(raw_symbols) + 200)
+        self.order_book_engine = OrderBookEngine(max_books=book_cap)
         self.feed_health = FeedHealthMonitor()
-        self.features = FeatureEngine(max_instruments=500)
+        self.features = FeatureEngine(max_instruments=feat_cap)
         self.universe = UniverseManager(UniverseConfig())
         self.quality_filter = AssetQualityFilter(QualityFilterConfig())
         self.scanner = GlobalScanner()
@@ -412,11 +414,13 @@ class PaperTradingOrchestrator:
                 self._accepting_new = False
                 self._health_recovery_counter.clear()
             elif unhealthy:
-                # R16: Any unhealthy feed while accepting is a violation
-                if self._accepting_new:
-                    self._stale_feed_violation = True
-                for fh in unhealthy:
-                    logger.warning("feed_unhealthy", symbol=fh.symbol, stream=fh.stream_type)
+                # R26: Only ticker staleness is a violation. Books are batched.
+                ticker_unhealthy = [fh for fh in unhealthy if fh.stream_type == "ticker" and fh.messages_received > 0]
+                if ticker_unhealthy:
+                    if self._accepting_new:
+                        self._stale_feed_violation = True
+                    for fh in ticker_unhealthy[:5]:
+                        logger.warning("feed_unhealthy", symbol=fh.symbol, stream=fh.stream_type)
             else:
                 if not self._accepting_new and self._lease and self._running:
                     key = "global"

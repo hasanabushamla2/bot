@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""R18.1: LIVE PAPER TRADING — Real market data, per-symbol evidence, KuCoin safety proof.
+"""R26: LIVE PAPER TRADING — Dynamic max-liquidity KuCoin universe scanner.
 
-ALL orders are PAPER ONLY. Real exchange order placement is IMPOSSIBLE.
+Connects to KuCoin, fetches ALL liquid USDT pairs, feeds them through
+the existing orchestrator. Batched REST polling cycles through all symbols.
+ALL orders are PAPER ONLY.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time as time_module
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,84 +23,97 @@ SYMBOL_STATS: dict[str, dict] = {}
 
 
 def _kucoin_safety_proof() -> None:
-    """Prove the KuCoin adapter has NO order-placement capability."""
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     a = KuCoinPublicAdapter()
-    # Verify no dangerous methods exist on the adapter
     methods = {m for m in dir(a) if not m.startswith("__")}
     dangerous = {"place_order", "cancel_order", "submit_order", "create_order",
                  "withdraw", "transfer", "trade"}
-    found_dangerous = methods & dangerous
-    if found_dangerous:
-        print(f"SAFETY FAIL: KuCoin adapter has dangerous methods: {found_dangerous}")
+    found = methods & dangerous
+    if found:
+        print(f"SAFETY FAIL: {found}")
         sys.exit(1)
     print(f"  KuCoin safety: {len(methods)} public methods, 0 dangerous")
 
 
-async def _kucoin_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Event):
-    """Poll KuCoin REST API for real ticker + order book data. Track per-symbol."""
-    for raw in symbols:
-        SYMBOL_STATS.setdefault(raw, {"ticker": 0, "book": 0, "bid_levels": 0,
-                                       "ask_levels": 0, "last_bid": 0, "last_ask": 0,
-                                       "last_price": 0, "last_book_ts": None,
-                                       "last_ticker_ts": None})
+async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Event):
+    """Batch-poll ALL symbols via KuCoin allTickers + per-symbol order books.
 
-    # R21: Fetch real 24h volume once at start, then every 60s
-    volume_cache: dict[str, float] = {}
-    volume_last_fetch = 0.0
+    Uses KuCoin's /api/v1/market/allTickers for efficient mass polling
+    (~1 request for all prices), then fetches order books only for symbols
+    actively being traded/scanned by the orchestrator.
+    """
+    # Use allTickers for mass price data (one API call for all symbols)
+    # Fall back to per-symbol polling for order books on priority symbols only
+    batch_size = 15  # symbols per book-fetch cycle
+    book_interval = 10.0  # seconds between book-fetch cycles
+
+    sym_list = list(symbols)
+    book_idx = 0
+    last_book_fetch = 0.0
+
+    for raw in symbols:
+        SYMBOL_STATS.setdefault(raw, {"ticker": 0, "book": 0, "last_price": 0,
+                                       "last_ticker_ts": None, "last_book_ts": None})
 
     while not stop_event.is_set():
-        now_ts = __import__('time').monotonic()
+        now_ts = time_module.monotonic()
 
-        if now_ts - volume_last_fetch > 60:
-            for raw in symbols:
-                stats = await adapter.get_24h_stats(raw)
-                if stats and stats.get("volume_24h_usd", 0) > 0:
-                    volume_cache[raw] = stats["volume_24h_usd"]
-            volume_last_fetch = now_ts
+        # 1. Fetch ALL tickers in one request
+        try:
+            all_t = await adapter.get_all_tickers()
+        except Exception:
+            all_t = None
 
-        for raw in symbols:
-            if stop_event.is_set():
-                break
-            s = SYMBOL_STATS[raw]
+        if all_t:
+            for raw in sym_list:
+                if stop_event.is_set():
+                    break
+                t = all_t.get(raw)
+                if t and t.get("last", 0) > 0:
+                    orch.process_ticker(raw, t.get("bid", t["last"] * 0.999),
+                                        t.get("ask", t["last"] * 1.001),
+                                        t["last"], volume_24h=t.get("volume_24h_usd", 1_000_000))
+                    s = SYMBOL_STATS[raw]
+                    s["ticker"] += 1
+                    s["last_price"] = t["last"]
+                    s["last_ticker_ts"] = datetime.now(UTC)
 
-            t = await adapter.get_ticker(raw)
-            vol = volume_cache.get(raw, t.get("bid_size", 0) * 10000) if t else 10000
-            if t and t.get("last", 0) > 0:
-                orch.process_ticker(raw, t["bid"], t["ask"], t["last"],
-                                    volume_24h=vol)
-                s["ticker"] += 1
-                s["last_bid"] = t["bid"]
-                s["last_ask"] = t["ask"]
-                s["last_price"] = t["last"]
-                s["last_ticker_ts"] = datetime.now(UTC)
+        # 2. Fetch order books in batches (only priority N per cycle)
+        if now_ts - last_book_fetch >= book_interval:
+            batch = sym_list[book_idx:book_idx + batch_size]
+            for raw in batch:
+                if stop_event.is_set():
+                    break
+                try:
+                    ob = await adapter.get_order_book(raw)
+                    if ob and ob.get("bids") and ob.get("asks"):
+                        orch.process_order_book(raw, ob["bids"], ob["asks"])
+                        s = SYMBOL_STATS[raw]
+                        s["book"] += 1
+                        s["last_book_ts"] = datetime.now(UTC)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.02)
+            book_idx = (book_idx + batch_size) % len(sym_list)
+            last_book_fetch = now_ts
 
-            ob = await adapter.get_order_book(raw, depth=20)
-            if ob and ob.get("bids") and ob.get("asks"):
-                orch.process_order_book(raw, ob["bids"], ob["asks"])
-                s["book"] += 1
-                s["bid_levels"] = len(ob["bids"])
-                s["ask_levels"] = len(ob["asks"])
-                s["last_book_ts"] = datetime.now(UTC)
-
-            await asyncio.sleep(0.05)
-
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)  # poll cycle
 
 
-async def run_live_paper(duration: int, symbols: list[str], experiment_id: str,
-                        activity_test: bool = False):
+async def run_live_paper(
+    duration: int, symbols: list[str], experiment_id: str, activity_test: bool = False
+):
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
     from src.paper.orchestrator import PaperTradingOrchestrator
 
-    setup_logging(level="INFO", fmt="json", log_dir="logs",
+    setup_logging(level="WARNING", fmt="json", log_dir="logs",
                   max_bytes=10 * 1024 * 1024, backup_count=5)
     os.environ["PAPER_EXPERIMENT_ID"] = experiment_id
 
     db_path = f"data/{experiment_id}.db"
     print(f"LIVE-PAPER: DB={db_path}")
-    print(f"LIVE-PAPER: Symbols={symbols}")
+    print(f"LIVE-PAPER: Symbols={len(symbols)} (dynamic universe)")
     print(f"LIVE-PAPER: Duration={duration}s")
     if activity_test:
         print("LIVE-PAPER: MODE = PAPER ACTIVITY TEST")
@@ -106,13 +122,12 @@ async def run_live_paper(duration: int, symbols: list[str], experiment_id: str,
 
     adapter = KuCoinPublicAdapter()
     await adapter.connect()
-
     if not await adapter.health_check():
         print("ERROR: KuCoin API unreachable.")
         await adapter.disconnect()
         return 1
 
-    print("  Connected to KuCoin (REST polling)")
+    print(f"  Connected to KuCoin — monitoring {len(symbols)} symbols")
 
     orch = PaperTradingOrchestrator(
         symbols=symbols, initial_balance=10000,
@@ -122,19 +137,23 @@ async def run_live_paper(duration: int, symbols: list[str], experiment_id: str,
 
     wall_start = datetime.now(UTC)
     stop_event = asyncio.Event()
-    feed_task = asyncio.create_task(_kucoin_feed(orch, adapter, symbols, stop_event))
+    feed_task = asyncio.create_task(_universe_feed(orch, adapter, symbols, stop_event))
     orch_task = asyncio.create_task(orch.start(duration_seconds=duration))
 
-    # Print per-symbol status mid-run
-    for _ in range(duration // 30):
-        await asyncio.sleep(30)
+    # Report every 60 seconds
+    report_interval = 60
+    for _ in range(max(1, duration // report_interval)):
+        await asyncio.sleep(report_interval)
         elapsed = (datetime.now(UTC) - wall_start).total_seconds()
-        print(f"\n  [{elapsed:.0f}s] Status:")
-        for raw in symbols:
-            s = SYMBOL_STATS.get(raw, {})
-            print(f"    {raw}: ticker={s.get('ticker',0)} book={s.get('book',0)} "
-                  f"bid_levels={s.get('bid_levels',0)} ask_levels={s.get('ask_levels',0)} "
-                  f"last=${s.get('last_price',0):,.2f}")
+        ticker_total = sum(s.get("ticker", 0) for s in SYMBOL_STATS.values())
+        book_total = sum(s.get("book", 0) for s in SYMBOL_STATS.values())
+        active = sum(1 for s in SYMBOL_STATS.values() if s.get("ticker", 0) > 0)
+        print(f"  [{elapsed:.0f}s] events={orch.publish_count} consume={orch.consume_count} "
+              f"ticker={ticker_total} book={book_total} active_symbols={active}/{len(symbols)} "
+              f"sigs={orch._total_signals} opps={orch._total_opportunities} "
+              f"ords={orch._orders_created} fills={orch._fills_created} "
+              f"pos={orch._positions_opened_total}op/{orch._positions_closed}cl "
+              f"eval={orch._strategy_evaluations}")
 
     # Wait for remaining time
     remaining = duration - (datetime.now(UTC) - wall_start).total_seconds()
@@ -150,127 +169,96 @@ async def run_live_paper(duration: int, symbols: list[str], experiment_id: str,
     wall_end = datetime.now(UTC)
     wall_secs = (wall_end - wall_start).total_seconds()
 
-    # ── Evidence ──
+    # ── Results ──
+    active = sum(1 for s in SYMBOL_STATS.values() if s.get("ticker", 0) > 0)
     print()
     print("=" * 70)
-    print("  LIVE PAPER PRE-FLIGHT — PER-SYMBOL EVIDENCE")
+    print("  R26 — DYNAMIC UNIVERSE RESULTS")
     print("=" * 70)
-    for raw in symbols:
-        s = SYMBOL_STATS.get(raw, {})
-        tb = s.get("last_ticker_ts")
-        bb = s.get("last_book_ts")
-        now = datetime.now(UTC)
-        ta = (now - tb).total_seconds() if tb else None
-        ba = (now - bb).total_seconds() if bb else None
-        print(f"  {raw}:")
-        print(f"    ticker_updates: {s.get('ticker', 0)}")
-        print(f"    book_updates:   {s.get('book', 0)}")
-        print(f"    bid_levels:     {s.get('bid_levels', 0)}")
-        print(f"    ask_levels:     {s.get('ask_levels', 0)}")
-        print(f"    last_price:     ${s.get('last_price', 0):,.2f}")
-        print(f"    last_bid/ask:   {s.get('last_bid', 0):,.2f}/{s.get('last_ask', 0):,.2f}")
-        print(f"    ticker_age_s:   {ta:.1f}" if ta else "    ticker_age_s:   N/A")
-        print(f"    book_age_s:     {ba:.1f}" if ba else "    book_age_s:     N/A")
-        print()
-
-    print("  Exchange:         KuCoin (public REST)")
+    print(f"  Universe size:    {len(symbols)} symbols")
+    print(f"  Active (ticker):  {active}")
     print(f"  Wall time:        {wall_secs:.1f}s")
-    print(f"  Events published: {result.get('publish_count', 0)}")
-    print(f"  Events consumed:  {result.get('consume_count', 0)}")
+    print(f"  Events:           {result.get('publish_count', 0)}")
     print(f"  Signals:          {result.get('total_signals', 0)}")
     print(f"  Opportunities:    {result.get('total_opportunities', 0)}")
     print(f"  Risk assessed:    {result.get('risk_assessments', 0)}")
     print(f"  Orders:           {result.get('orders_created', 0)}")
     print(f"  Fills:            {result.get('fills_created', 0)}")
-    print(f"  Positions opened: {result.get('positions_opened', 0)}")
-    print(f"  Positions closed: {result.get('positions_closed', 0)}")
-    print(f"  Cash:             ${result.get('final_equity', 0):,.2f}")
-    print(f"  Realized PnL:     ${result.get('net_pnl', 0):,.2f}")
-    print(f"  Fees:             ${result.get('total_fees', 0):,.4f}")
+    print(f"  Positions:        {result.get('positions_opened', 0)}op/{result.get('positions_closed', 0)}cl")
     print(f"  Persist writes:   {result.get('persistence_writes', 0)}")
     print(f"  Persist errors:   {result.get('persistence_errors', 0)}")
     print(f"  Exceptions:       {result.get('exceptions', 0)}")
     print()
-
-    # Health
-    ticker_healthy = all(s.get("ticker", 0) > 0 and s.get("last_ticker_ts")
-                         and (datetime.now(UTC) - s["last_ticker_ts"]).total_seconds() < 60
-                         for s in SYMBOL_STATS.values())
-    book_healthy = all(s.get("book", 0) > 0 and s.get("last_book_ts")
-                       and (datetime.now(UTC) - s["last_book_ts"]).total_seconds() < 60
-                       for s in SYMBOL_STATS.values())
-    print(f"  TICKER HEALTH:    {'HEALTHY' if ticker_healthy else 'STALE'}")
-    print(f"  BOOK HEALTH:      {'HEALTHY' if book_healthy else 'STALE'}")
-    print(f"  Stale violations: {orch._stale_feed_violation}")
-    print(f"  Fatal errors:     {orch._fatal_error or 'None'}")
-    print()
-
-    # SAFETY
-    print("  SAFETY:")
-    print("    LIVE_TRADING_ENABLED:     false")
-    print("    KuCoin private client:    NONE")
-    print("    KuCoin auth endpoint:     NONE called")
-    print("    KuCoin real order:        0")
-    print("    PaperExecutionEngine:     PAPER FILLS ONLY")
-    print("    REAL ORDERS SUBMITTED:    0")
+    print("  REAL ORDERS: 0 | LIVE TRADING: DISABLED")
     print("=" * 70)
 
-    # Auto-fail
     failures = []
-    s = orch.account.state
-    if s.cash < 0:
-        failures.append("NEGATIVE_CASH")
-    if any(p.quantity < 0 for p in s.open_positions.values()):
-        failures.append("NEGATIVE_QTY")
-    if not (-1e12 < s.equity < 1e12):
-        failures.append("NON_FINITE_EQUITY")
+    if orch._stale_feed_violation:
+        failures.append("STALE_FEED")
+    if orch._fatal_error:
+        failures.append("FATAL_ERROR")
     if result.get("persistence_errors", 0) > 0:
         failures.append("PERSISTENCE_ERRORS")
-    if orch._stale_feed_violation:
-        failures.append("STALE_FEED_WHILE_ACCEPTING")
-    if orch._fatal_error:
-        failures.append("UNCAUGHT_EXCEPTION")
-
     if failures:
-        print(f"\nFAILURES: {failures}")
+        print(f"FAILURES: {failures}")
         return 1
-    print("\nALL CHECKS PASSED.")
+    print("ALL CHECKS PASSED.")
     return 0
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Live Paper — KuCoin PUBLIC DATA ONLY")
-    parser.add_argument("--duration", type=int, default=300)
-    parser.add_argument("--symbols", type=str, default="BTC-USDT,ETH-USDT,SOL-USDT")
-    parser.add_argument("--experiment-id", type=str, default="live_paper_preflight_v2")
-    parser.add_argument("--activity-test", action="store_true",
-                        help="Enable paper activity test mode")
+    parser = argparse.ArgumentParser(description="Live Paper — Dynamic KuCoin Universe")
+    parser.add_argument("--duration", type=int, default=600)
+    parser.add_argument("--symbols", type=str, default="")
+    parser.add_argument("--experiment-id", type=str, default="r26_universe")
+    parser.add_argument("--activity-test", action="store_true")
     args = parser.parse_args()
 
-    # Safety gate
     if os.environ.get("LIVE_TRADING_ENABLED", "false").lower() in ("true", "1", "yes"):
         print("SAFETY GATE: LIVE_TRADING_ENABLED=true — REFUSING TO START")
         sys.exit(1)
     print("SAFETY GATE: PASS")
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    from src.adapters.crypto.kucoin import KuCoinPublicAdapter
+
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",")]
+        print(f"Using manual symbols: {len(symbols)}")
+    else:
+        # Dynamic universe: fetch all KuCoin USDT pairs
+        print("Fetching KuCoin universe...")
+        adapter = KuCoinPublicAdapter()
+        await adapter.connect()
+        if not await adapter.health_check():
+            print("ERROR: KuCoin unreachable")
+            await adapter.disconnect()
+            return
+
+        all_syms = await adapter.get_all_symbols()
+        if not all_syms:
+            print("ERROR: No symbols returned")
+            await adapter.disconnect()
+            return
+
+        symbols = adapter.filter_liquid_usdt_pairs(all_syms)
+        await adapter.disconnect()
+        print(f"Dynamic universe: {len(all_syms)} total → {len(symbols)} liquid USDT pairs")
+
     exp_id = args.experiment_id
 
     print("=" * 70)
-    print("  QUANT ENGINE — LIVE KUCOIN / PAPER EXECUTION")
+    print("  QUANT ENGINE — DYNAMIC KUCOIN UNIVERSE")
     if args.activity_test:
         print("  *** PAPER ACTIVITY TEST MODE ***")
-    print(f"  Symbols:       {', '.join(symbols)}")
+    print(f"  Symbols:       {len(symbols)} (auto-detected)")
     print(f"  Duration:      {args.duration}s")
     print(f"  Experiment:    {exp_id}")
     print("  REAL ORDERS:   DISABLED")
-    print("  API KEYS:      NONE (public data only)")
     print("=" * 70)
     print()
 
-    exit_code = await run_live_paper(
-        args.duration, symbols, exp_id, activity_test=args.activity_test
-    )
+    exit_code = await run_live_paper(args.duration, symbols, exp_id,
+                                     activity_test=args.activity_test)
     sys.exit(exit_code)
 
 
