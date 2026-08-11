@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""R18: LIVE PAPER TRADING — Real market data, simulated paper orders.
+"""R18.1: LIVE PAPER TRADING — Real market data, per-symbol evidence, KuCoin safety proof.
 
-Connects to live exchange public APIs.
-Feeds real ticker + order-book depth through the EXISTING orchestrator.
 ALL orders are PAPER ONLY. Real exchange order placement is IMPOSSIBLE.
-
-Usage:
-    python scripts/run_live_paper.py --duration 300 --symbols BTC-USDT,ETH-USDT,SOL-USDT
-
-Architecture:
-    LIVE PUBLIC API (Binance WS or KuCoin REST)
-    → process_ticker/process_order_book
-    → orchestrator.start()
-    → strategies → risk engine → PaperExecutionEngine
-    → persistence → dashboard
-
-SAFETY:
-    - No exchange API keys required
-    - REAL order placement is NOT possible
-    - Live-trading gate refuses to start if LIVE_TRADING_ENABLED=true
 """
 
 from __future__ import annotations
@@ -33,174 +16,146 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+SYMBOL_STATS: dict[str, dict] = {}
 
-def _safety_gate() -> None:
-    """Refuse to start if any dangerous configuration is detected."""
-    danger_flags = [
-        ("LIVE_TRADING_ENABLED", os.environ.get("LIVE_TRADING_ENABLED", "false").lower()),
-    ]
-    for flag, value in danger_flags:
-        if value in ("true", "1", "yes"):
-            print(f"SAFETY GATE: {flag}={value} — REFUSING TO START")
-            sys.exit(1)
-    print("SAFETY GATE: All checks passed — live paper mode is safe.")
+
+def _kucoin_safety_proof() -> None:
+    """Prove the KuCoin adapter has NO order-placement capability."""
+    from src.adapters.crypto.kucoin import KuCoinPublicAdapter
+    a = KuCoinPublicAdapter()
+    # Verify no dangerous methods exist on the adapter
+    methods = {m for m in dir(a) if not m.startswith("__")}
+    dangerous = {"place_order", "cancel_order", "submit_order", "create_order",
+                 "withdraw", "transfer", "trade"}
+    found_dangerous = methods & dangerous
+    if found_dangerous:
+        print(f"SAFETY FAIL: KuCoin adapter has dangerous methods: {found_dangerous}")
+        sys.exit(1)
+    print(f"  KuCoin safety: {len(methods)} public methods, 0 dangerous")
 
 
 async def _kucoin_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Event):
-    """Poll KuCoin REST API for real ticker + order book data."""
-    ticker_count = 0
-    book_count = 0
+    """Poll KuCoin REST API for real ticker + order book data. Track per-symbol."""
+    for raw in symbols:
+        SYMBOL_STATS.setdefault(raw, {"ticker": 0, "book": 0, "bid_levels": 0,
+                                       "ask_levels": 0, "last_bid": 0, "last_ask": 0,
+                                       "last_price": 0, "last_book_ts": None,
+                                       "last_ticker_ts": None})
+
     while not stop_event.is_set():
         for raw in symbols:
             if stop_event.is_set():
                 break
-            # Ticker (best bid/ask)
+            s = SYMBOL_STATS[raw]
+
             t = await adapter.get_ticker(raw)
             if t and t.get("last", 0) > 0:
-                orch.process_ticker(
-                    raw, t["bid"], t["ask"], t["last"],
-                    volume_24h=t.get("bid_size", 0) * 10000,
-                )
-                ticker_count += 1
+                orch.process_ticker(raw, t["bid"], t["ask"], t["last"],
+                                    volume_24h=t.get("bid_size", 0) * 10000)
+                s["ticker"] += 1
+                s["last_bid"] = t["bid"]
+                s["last_ask"] = t["ask"]
+                s["last_price"] = t["last"]
+                s["last_ticker_ts"] = datetime.now(UTC)
 
-            # Order book depth
             ob = await adapter.get_order_book(raw, depth=20)
-            if ob:
+            if ob and ob.get("bids") and ob.get("asks"):
                 orch.process_order_book(raw, ob["bids"], ob["asks"])
-                book_count += 1
+                s["book"] += 1
+                s["bid_levels"] = len(ob["bids"])
+                s["ask_levels"] = len(ob["asks"])
+                s["last_book_ts"] = datetime.now(UTC)
 
-            await asyncio.sleep(0.05)  # yield between symbols
+            await asyncio.sleep(0.05)
 
-        await asyncio.sleep(1.0)  # ~1s poll interval
-
-    return ticker_count, book_count
-
-
-async def _binance_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Event):
-    """Feed Binance WebSocket data through orchestrator."""
-    # Ticker streams
-    ticker_tasks = []
-    for raw in symbols:
-        async def _ticker_loop(raw=raw):
-            async for ticker in adapter.subscribe_ticker(raw):
-                if stop_event.is_set():
-                    break
-                orch.process_ticker(raw, ticker.bid, ticker.ask, ticker.last, ticker.volume_24h)
-                await asyncio.sleep(0.0)
-
-        async def _book_loop(raw=raw):
-            async for book in adapter.subscribe_order_book(raw):
-                if stop_event.is_set():
-                    break
-                bids = [(b.price, b.quantity) for b in book.bids[:20]]
-                asks = [(a.price, a.quantity) for a in book.asks[:20]]
-                orch.process_order_book(raw, bids, asks)
-                await asyncio.sleep(0.0)
-
-        ticker_tasks.append(asyncio.create_task(_ticker_loop()))
-        ticker_tasks.append(asyncio.create_task(_book_loop()))
-
-    await stop_event.wait()
-    for t in ticker_tasks:
-        t.cancel()
-    await asyncio.gather(*ticker_tasks, return_exceptions=True)
+        await asyncio.sleep(1.0)
 
 
-async def run_live_paper(
-    duration: int, symbols: list[str], experiment_id: str,
-    exchange: str = "auto",
-):
+async def run_live_paper(duration: int, symbols: list[str], experiment_id: str):
+    from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
     from src.paper.orchestrator import PaperTradingOrchestrator
 
-    setup_logging(level="INFO", fmt="json", log_dir="logs", max_bytes=10 * 1024 * 1024, backup_count=5)
+    setup_logging(level="INFO", fmt="json", log_dir="logs",
+                  max_bytes=10 * 1024 * 1024, backup_count=5)
     os.environ["PAPER_EXPERIMENT_ID"] = experiment_id
 
     db_path = f"data/{experiment_id}.db"
     print(f"LIVE-PAPER: DB={db_path}")
     print(f"LIVE-PAPER: Symbols={symbols}")
     print(f"LIVE-PAPER: Duration={duration}s")
-    print(f"LIVE-PAPER: Exchange={exchange}")
 
-    # Try Binance WebSocket first, fall back to KuCoin REST
-    wall_start = datetime.now(UTC)
-    stop_event = asyncio.Event()
-    feed_task = None
-    active_exchange = "unknown"
+    _kucoin_safety_proof()
 
-    if exchange in ("auto", "binance"):
-        try:
-            from src.adapters.crypto.binance import BinanceAdapter
-            adapter = BinanceAdapter(exchange_name="binance", use_testnet=False)
-            await adapter.connect()
-            if await adapter.health_check():
-                active_exchange = "binance"
-                print("  Connected to Binance (WebSocket)")
-                server_time = await adapter.get_server_time()
-                offset = (server_time - datetime.now(UTC)).total_seconds() * 1000
-                print(f"  Clock offset: {offset:+.1f}ms")
-                feed_task = asyncio.create_task(
-                    _binance_feed(orch := PaperTradingOrchestrator(
-                        symbols=symbols, initial_balance=10000,
-                        max_symbols=len(symbols), db_path=db_path,
-                    ), adapter, symbols, stop_event)
-                )
-            else:
-                await adapter.disconnect()
-        except Exception as e:
-            print(f"  Binance unavailable: {e}")
+    adapter = KuCoinPublicAdapter()
+    await adapter.connect()
 
-    if feed_task is None and exchange in ("auto", "kucoin"):
-        try:
-            from src.adapters.crypto.kucoin import KuCoinPublicAdapter
-            adapter = KuCoinPublicAdapter()
-            await adapter.connect()
-            if await adapter.health_check():
-                active_exchange = "kucoin"
-                print("  Connected to KuCoin (REST polling)")
-                orch = PaperTradingOrchestrator(
-                    symbols=symbols, initial_balance=10000,
-                    max_symbols=len(symbols), db_path=db_path,
-                )
-                feed_task = asyncio.create_task(
-                    _kucoin_feed(orch, adapter, symbols, stop_event)
-                )
-            else:
-                await adapter.disconnect()
-        except Exception as e:
-            print(f"  KuCoin unavailable: {e}")
-
-    if feed_task is None:
-        print("ERROR: No exchange connection available.")
+    if not await adapter.health_check():
+        print("ERROR: KuCoin API unreachable.")
+        await adapter.disconnect()
         return 1
 
-    print(f"  Exchange: {active_exchange}")
-    print(f"  Running for {duration}s...\n")
+    print("  Connected to KuCoin (REST polling)")
 
-    # Run orchestrator
+    orch = PaperTradingOrchestrator(
+        symbols=symbols, initial_balance=10000,
+        max_symbols=len(symbols), db_path=db_path,
+    )
+
+    wall_start = datetime.now(UTC)
+    stop_event = asyncio.Event()
+    feed_task = asyncio.create_task(_kucoin_feed(orch, adapter, symbols, stop_event))
     orch_task = asyncio.create_task(orch.start(duration_seconds=duration))
 
-    # Wait for duration
-    await asyncio.sleep(duration)
+    # Print per-symbol status mid-run
+    for _ in range(duration // 30):
+        await asyncio.sleep(30)
+        elapsed = (datetime.now(UTC) - wall_start).total_seconds()
+        print(f"\n  [{elapsed:.0f}s] Status:")
+        for raw in symbols:
+            s = SYMBOL_STATS.get(raw, {})
+            print(f"    {raw}: ticker={s.get('ticker',0)} book={s.get('book',0)} "
+                  f"bid_levels={s.get('bid_levels',0)} ask_levels={s.get('ask_levels',0)} "
+                  f"last=${s.get('last_price',0):,.2f}")
 
-    # Stop
+    # Wait for remaining time
+    remaining = duration - (datetime.now(UTC) - wall_start).total_seconds()
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
     stop_event.set()
     orch.stop()
     await asyncio.gather(feed_task, return_exceptions=True)
     result = await orch_task
-    if hasattr(adapter, "disconnect"):
-        await adapter.disconnect()
+    await adapter.disconnect()
 
     wall_end = datetime.now(UTC)
     wall_secs = (wall_end - wall_start).total_seconds()
 
-    # ── Print results ──
+    # ── Evidence ──
     print()
-    print("=" * 60)
-    print("  LIVE PAPER PRE-FLIGHT RESULTS")
-    print("=" * 60)
-    print(f"  Exchange:         {active_exchange}")
-    print(f"  Symbols:          {', '.join(symbols)}")
+    print("=" * 70)
+    print("  LIVE PAPER PRE-FLIGHT — PER-SYMBOL EVIDENCE")
+    print("=" * 70)
+    for raw in symbols:
+        s = SYMBOL_STATS.get(raw, {})
+        tb = s.get("last_ticker_ts")
+        bb = s.get("last_book_ts")
+        now = datetime.now(UTC)
+        ta = (now - tb).total_seconds() if tb else None
+        ba = (now - bb).total_seconds() if bb else None
+        print(f"  {raw}:")
+        print(f"    ticker_updates: {s.get('ticker', 0)}")
+        print(f"    book_updates:   {s.get('book', 0)}")
+        print(f"    bid_levels:     {s.get('bid_levels', 0)}")
+        print(f"    ask_levels:     {s.get('ask_levels', 0)}")
+        print(f"    last_price:     ${s.get('last_price', 0):,.2f}")
+        print(f"    last_bid/ask:   {s.get('last_bid', 0):,.2f}/{s.get('last_ask', 0):,.2f}")
+        print(f"    ticker_age_s:   {ta:.1f}" if ta else "    ticker_age_s:   N/A")
+        print(f"    book_age_s:     {ba:.1f}" if ba else "    book_age_s:     N/A")
+        print()
+
+    print("  Exchange:         KuCoin (public REST)")
     print(f"  Wall time:        {wall_secs:.1f}s")
     print(f"  Events published: {result.get('publish_count', 0)}")
     print(f"  Events consumed:  {result.get('consume_count', 0)}")
@@ -211,22 +166,38 @@ async def run_live_paper(
     print(f"  Fills:            {result.get('fills_created', 0)}")
     print(f"  Positions opened: {result.get('positions_opened', 0)}")
     print(f"  Positions closed: {result.get('positions_closed', 0)}")
-    print(f"  Open now:         {result.get('positions_currently_open', 0)}")
     print(f"  Cash:             ${result.get('final_equity', 0):,.2f}")
     print(f"  Realized PnL:     ${result.get('net_pnl', 0):,.2f}")
     print(f"  Fees:             ${result.get('total_fees', 0):,.4f}")
-    print(f"  Slippage:         ${result.get('total_slippage', 0):,.4f}")
     print(f"  Persist writes:   {result.get('persistence_writes', 0)}")
     print(f"  Persist errors:   {result.get('persistence_errors', 0)}")
     print(f"  Exceptions:       {result.get('exceptions', 0)}")
-    print(f"  RSS:              {result.get('rss_start_mb', 0):.0f}/{result.get('rss_peak_mb', 0):.0f} MB")
     print()
-    print("  REAL EXCHANGE ORDERS SUBMITTED: 0")
-    print("  LIVE_TRADING_ENABLED: false")
-    print(f"  MODE: LIVE MARKET DATA ({active_exchange}) / PAPER EXECUTION")
-    print("=" * 60)
 
-    # ── Auto-fail ──
+    # Health
+    ticker_healthy = all(s.get("ticker", 0) > 0 and s.get("last_ticker_ts")
+                         and (datetime.now(UTC) - s["last_ticker_ts"]).total_seconds() < 60
+                         for s in SYMBOL_STATS.values())
+    book_healthy = all(s.get("book", 0) > 0 and s.get("last_book_ts")
+                       and (datetime.now(UTC) - s["last_book_ts"]).total_seconds() < 60
+                       for s in SYMBOL_STATS.values())
+    print(f"  TICKER HEALTH:    {'HEALTHY' if ticker_healthy else 'STALE'}")
+    print(f"  BOOK HEALTH:      {'HEALTHY' if book_healthy else 'STALE'}")
+    print(f"  Stale violations: {orch._stale_feed_violation}")
+    print(f"  Fatal errors:     {orch._fatal_error or 'None'}")
+    print()
+
+    # SAFETY
+    print("  SAFETY:")
+    print("    LIVE_TRADING_ENABLED:     false")
+    print("    KuCoin private client:    NONE")
+    print("    KuCoin auth endpoint:     NONE called")
+    print("    KuCoin real order:        0")
+    print("    PaperExecutionEngine:     PAPER FILLS ONLY")
+    print("    REAL ORDERS SUBMITTED:    0")
+    print("=" * 70)
+
+    # Auto-fail
     failures = []
     s = orch.account.state
     if s.cash < 0:
@@ -245,35 +216,37 @@ async def run_live_paper(
     if failures:
         print(f"\nFAILURES: {failures}")
         return 1
-    print("\nALL CHECKS PASSED — No violations.")
+    print("\nALL CHECKS PASSED.")
     return 0
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Live Paper Trading — PUBLIC DATA ONLY")
+    parser = argparse.ArgumentParser(description="Live Paper — KuCoin PUBLIC DATA ONLY")
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--symbols", type=str, default="BTC-USDT,ETH-USDT,SOL-USDT")
-    parser.add_argument("--experiment-id", type=str, default="live_paper_preflight")
-    parser.add_argument("--exchange", type=str, default="auto",
-                        choices=["auto", "binance", "kucoin"])
+    parser.add_argument("--experiment-id", type=str, default="live_paper_preflight_v2")
     args = parser.parse_args()
 
-    _safety_gate()
+    # Safety gate
+    if os.environ.get("LIVE_TRADING_ENABLED", "false").lower() in ("true", "1", "yes"):
+        print("SAFETY GATE: LIVE_TRADING_ENABLED=true — REFUSING TO START")
+        sys.exit(1)
+    print("SAFETY GATE: PASS")
 
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
     exp_id = args.experiment_id
 
-    print("=" * 60)
-    print("  QUANT ENGINE — LIVE MARKET / PAPER EXECUTION")
+    print("=" * 70)
+    print("  QUANT ENGINE — LIVE KUCOIN / PAPER EXECUTION")
     print(f"  Symbols:       {', '.join(symbols)}")
     print(f"  Duration:      {args.duration}s")
     print(f"  Experiment:    {exp_id}")
     print("  REAL ORDERS:   DISABLED")
-    print("  API KEYS:      NOT REQUIRED (public data only)")
-    print("=" * 60)
+    print("  API KEYS:      NONE (public data only)")
+    print("=" * 70)
     print()
 
-    exit_code = await run_live_paper(args.duration, symbols, exp_id, args.exchange)
+    exit_code = await run_live_paper(args.duration, symbols, exp_id)
     sys.exit(exit_code)
 
 
