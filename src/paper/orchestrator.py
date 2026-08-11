@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import resource
 import signal
 import time
 import uuid
@@ -13,6 +12,19 @@ from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+
+def _get_memory_mb() -> float:
+    """Get process RSS memory in MB. Cross-platform: psutil, resource, or 0."""
+    try:
+        import psutil
+        return float(psutil.Process().memory_info().rss / (1024 * 1024))
+    except Exception:
+        try:
+            import resource
+            return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)
+        except Exception:
+            return 0.0
 
 from src.analytics.tracker import AnalyticsTracker
 from src.core.logging_config import get_logger
@@ -275,17 +287,12 @@ class PaperTradingOrchestrator:
 
     # ══════════════════════════════════════════════════════════════════
     def _sample_resources_start(self) -> None:
-        try:
-            r = resource.getrusage(resource.RUSAGE_SELF)
-            self._rss_start_mb = r.ru_maxrss / 1024.0
-        except Exception:
-            self._rss_start_mb = 0.0
+        self._rss_start_mb = _get_memory_mb()
         self._task_count_start = len(asyncio.all_tasks())
 
     def _sample_resource_peak(self) -> None:
         try:
-            r = resource.getrusage(resource.RUSAGE_SELF)
-            mb = r.ru_maxrss / 1024.0
+            mb = _get_memory_mb()
             if mb > self._rss_peak_mb:
                 self._rss_peak_mb = mb
             tc = len(asyncio.all_tasks())
@@ -940,10 +947,7 @@ class PaperTradingOrchestrator:
     def _final_report(self) -> dict[str, Any]:
         s = self.account.state
         wall_secs = (datetime.now(UTC) - self._wall_start).total_seconds() if self._wall_start else 0
-        try:
-            rss_now = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-        except Exception:
-            rss_now = 0.0
+        rss_now = _get_memory_mb()
         return {
             "status": "complete",
             "duration_seconds": time.monotonic() - self._start_time,

@@ -41,6 +41,7 @@ dependencies = [
     "orjson>=3.10",
     "python-dateutil>=2.9",
     "pyarrow>=19.0",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
@@ -149,6 +150,12 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["yaml", "yaml.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["psutil", "psutil.*"]
+ignore_missing_imports = true
+
+
 
 [tool.pytest.ini_options]
 minversion = "7.0"
