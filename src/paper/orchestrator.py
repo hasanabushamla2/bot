@@ -197,6 +197,10 @@ class PaperTradingOrchestrator:
         # R14: closed-trade dedup set to prevent re-persistence
         self._persisted_trade_ids: set[str] = set()
 
+        # R16: runtime safety flags for soak auto-fail detection
+        self._fatal_error: str | None = None
+        self._stale_feed_violation: bool = False
+
         try:
             signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
             signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
@@ -382,9 +386,15 @@ class PaperTradingOrchestrator:
             unhealthy = self.feed_health.check_all()
             all_feeds = self.feed_health.get_all()
             if all_feeds and all(not f.is_healthy for f in all_feeds):
+                # R16: Record stale-feed violation WHILE still accepting new
+                if self._accepting_new:
+                    self._stale_feed_violation = True
                 self._accepting_new = False
                 self._health_recovery_counter.clear()
             elif unhealthy:
+                # R16: Any unhealthy feed while accepting is a violation
+                if self._accepting_new:
+                    self._stale_feed_violation = True
                 for fh in unhealthy:
                     logger.warning("feed_unhealthy", symbol=fh.symbol, stream=fh.stream_type)
             else:
@@ -893,11 +903,18 @@ class PaperTradingOrchestrator:
             try:
                 await self._scan_tick()
                 await asyncio.sleep(self._scan_interval)
+            except asyncio.CancelledError:
+                break
             except Exception:
                 self._exceptions += 1
                 logger.exception("scan_loop_error")
                 self._error_log.append({"error": "scan_loop", "time": datetime.now(UTC).isoformat()})
-                await asyncio.sleep(10.0)
+                # R16: Record the first fatal error and stop
+                if self._fatal_error is None:
+                    self._fatal_error = f"fatal_scan_loop_exception_at_{datetime.now(UTC).isoformat()}"
+                self._running = False
+                self._accepting_new = False
+                break
 
     async def _report_loop(self) -> None:
         while self._running:

@@ -217,6 +217,13 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
     failures: list[str] = []
     if uncaught_error:
         failures.append("UNCAUGHT_EXCEPTION")
+    # R16: detect inner runtime fatal error flagged by orchestrator
+    if orch._fatal_error:
+        if "UNCAUGHT_EXCEPTION" not in failures:
+            failures.append("UNCAUGHT_EXCEPTION")
+    # R16: detect stale-feed violation captured DURING runtime
+    if orch._stale_feed_violation:
+        failures.append("STALE_FEED_WHILE_ACCEPTING")
     try:
         s = orch.account.state
         if s.cash < 0:
@@ -227,11 +234,6 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
             failures.append("NON_FINITE_EQUITY")
         if result.get("persistence_errors", 0) > 0:
             failures.append("PERSISTENCE_ERRORS")
-        all_healthy = all(
-            f.is_healthy for f in orch.feed_health.get_all()
-        ) if orch.feed_health.get_all() else True
-        if not all_healthy and orch._accepting_new:
-            failures.append("STALE_FEED_WHILE_ACCEPTING")
     except Exception:
         pass
 
@@ -247,6 +249,8 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
                 summary["invariants"]["equity_finite"] = False
         if uncaught_error:
             summary["exception"] = uncaught_error[:2000]
+        elif orch._fatal_error:
+            summary["exception"] = orch._fatal_error[:2000]
 
     # ── Write artifact (always happens, even on failure) ──
     artifact_path = artifact_dir / "summary.json"
