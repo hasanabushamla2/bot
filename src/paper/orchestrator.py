@@ -45,6 +45,16 @@ LEASE_HEARTBEAT_SEC = 15.0
 LEASE_EXPIRY_SEC = 45.0
 
 
+def _parse_iso_or_now(s: str) -> datetime:
+    """Parse ISO timestamp string, fall back to now if unparseable."""
+    if not s:
+        return datetime.now(UTC)
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return datetime.now(UTC)
+
+
 class _RuntimeLease:
     def __init__(self, persist: PaperPersistence, account_id: str, owner_id: str) -> None:
         self._persist = persist
@@ -164,6 +174,7 @@ class PaperTradingOrchestrator:
         self._orders_created = 0
         self._fills_created = 0
         self._partial_fills = 0
+        self._positions_opened_total = 0  # R15: cumulative counter
         self._positions_closed = 0
         self._trailing_exits = 0
         self._hard_stop_exits = 0
@@ -300,9 +311,11 @@ class PaperTradingOrchestrator:
             s.loss_count = saved.get("loss_count", 0)
             s.peak_equity = saved.get("peak_equity", self.initial_balance)
 
-        # R14 M-01: Bounded recent closed trades from DB (SQL LIMIT)
+        # R15: Restore closed trades with original timestamps and trade_id from DB
         db_trades = self._persist.load_recent_closed_trades(200)
         for t_dict in db_trades:
+            entry_time = _parse_iso_or_now(t_dict.get("entry_time", ""))
+            exit_time = _parse_iso_or_now(t_dict.get("exit_time", ""))
             ct = ClosedTrade(
                 symbol=t_dict["symbol"], direction=t_dict.get("direction", "long"),
                 entry_price=t_dict["entry_price"], exit_price=t_dict["exit_price"],
@@ -311,8 +324,13 @@ class PaperTradingOrchestrator:
                 net_pnl=t_dict.get("net_pnl", 0), return_pct=t_dict.get("return_pct", 0),
                 exit_reason=t_dict.get("exit_reason", ""),
                 strategy_id=t_dict.get("strategy_id", ""),
+                entry_time=entry_time,
+                exit_time=exit_time,
+                trade_id=t_dict.get("trade_id", ""),
             )
             self.account.state.closed_trades.append(ct)
+            if ct.trade_id:
+                self._persisted_trade_ids.add(ct.trade_id)
 
         positions = self._persist.load_open_positions()
         for p_dict in positions:
@@ -501,13 +519,18 @@ class PaperTradingOrchestrator:
             self._persistence_errors += 1
 
     def _persist_closed_trade(self, trade: ClosedTrade) -> None:
-        """R14 P-02: Deterministic ID, dedup via in-memory set + DB check."""
+        """R15 P-02: Use existing durable trade_id or generate deterministic one."""
         if self._persist is None:
             return
-        trade_id = (
-            f"ct-{trade.symbol}-{trade.exit_time.strftime('%Y%m%d%H%M%S%f')[:16]}"
-            f"-{trade.entry_price:.2f}-{trade.exit_price:.2f}-{trade.quantity:.6f}"
-        )
+        # Use existing durable trade_id if set (restored trades)
+        if trade.trade_id:
+            trade_id = trade.trade_id
+        else:
+            trade_id = (
+                f"ct-{trade.symbol}-{trade.exit_time.strftime('%Y%m%d%H%M%S%f')[:16]}"
+                f"-{trade.entry_price:.2f}-{trade.exit_price:.2f}-{trade.quantity:.6f}"
+            )
+            trade.trade_id = trade_id  # Store for future reference
         if trade_id in self._persisted_trade_ids:
             return
         if self._persist.closed_trade_exists(trade_id):
@@ -844,6 +867,7 @@ class PaperTradingOrchestrator:
             if pos:
                 pos_id = f"pos-{sym}"
                 self.monitor.register_position(pos)
+                self._positions_opened_total += 1  # R15: cumulative
                 self._total_trades += 1
                 self.analytics.record_allocation(
                     sym, opp.signal.strategy_id, "binance",
@@ -922,8 +946,9 @@ class PaperTradingOrchestrator:
             "orders_created": self._orders_created,
             "fills_created": self._fills_created,
             "partial_fills": self._partial_fills,
-            "positions_opened": len(s.open_positions),
+            "positions_opened": self._positions_opened_total,
             "positions_closed": self._positions_closed,
+            "positions_currently_open": len(s.open_positions),
             "trailing_exits": self._trailing_exits,
             "hard_stop_exits": self._hard_stop_exits,
             "publish_count": self.publish_count,

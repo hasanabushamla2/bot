@@ -55,6 +55,7 @@ class ClosedTrade:
     entry_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     exit_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     strategy_id: str = ""
+    trade_id: str = ""  # R15: durable identity, stable across restarts
 
 
 @dataclass
