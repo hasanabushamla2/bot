@@ -85,7 +85,8 @@ async def _kucoin_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Ev
         await asyncio.sleep(1.0)
 
 
-async def run_live_paper(duration: int, symbols: list[str], experiment_id: str):
+async def run_live_paper(duration: int, symbols: list[str], experiment_id: str,
+                        activity_test: bool = False):
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
     from src.paper.orchestrator import PaperTradingOrchestrator
@@ -98,6 +99,8 @@ async def run_live_paper(duration: int, symbols: list[str], experiment_id: str):
     print(f"LIVE-PAPER: DB={db_path}")
     print(f"LIVE-PAPER: Symbols={symbols}")
     print(f"LIVE-PAPER: Duration={duration}s")
+    if activity_test:
+        print("LIVE-PAPER: MODE = PAPER ACTIVITY TEST")
 
     _kucoin_safety_proof()
 
@@ -114,6 +117,7 @@ async def run_live_paper(duration: int, symbols: list[str], experiment_id: str):
     orch = PaperTradingOrchestrator(
         symbols=symbols, initial_balance=10000,
         max_symbols=len(symbols), db_path=db_path,
+        activity_test=activity_test,
     )
 
     wall_start = datetime.now(UTC)
@@ -239,6 +243,8 @@ async def main():
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--symbols", type=str, default="BTC-USDT,ETH-USDT,SOL-USDT")
     parser.add_argument("--experiment-id", type=str, default="live_paper_preflight_v2")
+    parser.add_argument("--activity-test", action="store_true",
+                        help="Enable paper activity test mode")
     args = parser.parse_args()
 
     # Safety gate
@@ -252,6 +258,8 @@ async def main():
 
     print("=" * 70)
     print("  QUANT ENGINE — LIVE KUCOIN / PAPER EXECUTION")
+    if args.activity_test:
+        print("  *** PAPER ACTIVITY TEST MODE ***")
     print(f"  Symbols:       {', '.join(symbols)}")
     print(f"  Duration:      {args.duration}s")
     print(f"  Experiment:    {exp_id}")
@@ -260,7 +268,9 @@ async def main():
     print("=" * 70)
     print()
 
-    exit_code = await run_live_paper(args.duration, symbols, exp_id)
+    exit_code = await run_live_paper(
+        args.duration, symbols, exp_id, activity_test=args.activity_test
+    )
     sys.exit(exit_code)
 
 

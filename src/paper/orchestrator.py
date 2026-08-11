@@ -133,6 +133,7 @@ class PaperTradingOrchestrator:
         initial_balance: float = 10_000.0,
         max_symbols: int = 50,
         db_path: str = "data/paper_trading.db",
+        activity_test: bool = False,
     ) -> None:
         raw_symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         self._raw_to_canonical: dict[str, str] = {}
@@ -144,6 +145,8 @@ class PaperTradingOrchestrator:
         self.initial_balance = initial_balance
         self.max_symbols = max_symbols
         self._db_path = db_path
+        self._activity_test = activity_test
+        self._last_test_signal_time: float = 0.0
 
         self.event_bus = EventBus(default_max_queue=500)
         self.order_book_engine = OrderBookEngine(max_books=200)
@@ -829,6 +832,19 @@ class PaperTradingOrchestrator:
                 except Exception:
                     self._exceptions += 1
         self._total_signals += len(strategy_signals)
+
+        # R22: Activity test mode — inject controlled paper signals using real prices
+        if self._activity_test and not strategy_signals:
+            test_sigs = self._inject_test_signals()
+            strategy_signals.extend(test_sigs)
+            self._total_signals += len(test_sigs)
+            if test_sigs:
+                logger.info(
+                    "activity_test_signals",
+                    count=len(test_sigs),
+                    symbols=[s.symbol for s in test_sigs],
+                )
+
         if not strategy_signals:
             return
 
@@ -967,6 +983,61 @@ class PaperTradingOrchestrator:
         # Persist trail state at runtime
         for sym in list(self.account.state.open_positions.keys()):
             self._persist_trail(f"pos-{sym}")
+
+    # R22: Activity test signal injector — uses real current prices
+    def _inject_test_signals(self) -> list:
+        """Generate controlled paper signals for pipeline verification.
+
+        Creates one BUY signal per eligible symbol using CURRENT real prices.
+        Only fires every ~60s to avoid flooding. NEVER touches real exchange.
+        """
+        now = time.monotonic()
+        if now - self._last_test_signal_time < 60.0:
+            return []
+        self._last_test_signal_time = now
+
+        from datetime import timedelta
+
+        from src.strategies.base import SignalDirection, StrategySignal
+
+        signals = []
+        eligible = [
+            s for s in self._canonical_symbols
+            if s not in self.account.state.open_positions
+            and self.features.get(s).last_price > 0
+        ]
+        if not eligible:
+            return []
+
+        sym = eligible[0]
+        feat = self.features.get(sym)
+        price = feat.last_price
+
+        sig = StrategySignal(
+            strategy_id="activity_test_v1",
+            symbol=sym,
+            direction=SignalDirection.LONG,
+            confidence=0.99,
+            estimated_return=0.01,
+            estimated_risk=0.3,
+            timestamp=datetime.now(UTC),
+            signal_expires_at=datetime.now(UTC) + timedelta(seconds=120),
+            entry_logic={"type": "activity_test", "price": price},
+            exit_logic={
+                "hard_stop_pct": 0.30,
+                "trail_pct": 0.20,
+                "activation_pct": 0.20,
+                "no_fixed_take_profit": True,
+            },
+            metadata={
+                "entry_price": price,
+                "stop_loss_pct": 0.30,
+                "test_mode": True,
+            },
+        )
+        signals.append(sig)
+        logger.info("activity_test_signal_created", symbol=sym, price=round(price, 2))
+        return signals
 
     async def _scan_loop(self) -> None:
         while self._running:
