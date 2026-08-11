@@ -190,11 +190,15 @@ class FeedHealthMonitor:
         now = datetime.now(UTC)
         unhealthy = []
         for fh in self._feeds.values():
-            if not self._assess(fh):
+            was_healthy = fh.is_healthy
+            fh.is_healthy = self._assess(fh)  # R12: Update is_healthy on every check
+            if not fh.is_healthy:
                 unhealthy.append(fh)
+                if was_healthy:
+                    fh.stale_since = now
             # Update stale duration
-            if not fh.is_healthy and fh.last_healthy_at:
-                fh.stale_duration_seconds = (now - fh.last_healthy_at).total_seconds()
+            if fh.stale_since is not None:
+                fh.stale_duration_seconds = (now - fh.stale_since).total_seconds()
             if fh.stale_duration_seconds > self.critical_stale_seconds:
                 fh.status = FeedStatus.DISCONNECTED
         return unhealthy

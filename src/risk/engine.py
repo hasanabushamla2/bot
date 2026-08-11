@@ -322,6 +322,49 @@ class RiskEngine:
         sid = assessment.opportunity.signal.strategy_id
         self._strategy_position_counts[sid] = self._strategy_position_counts.get(sid, 0) + 1
 
+    # ── R12: Persistence support ──
+
+    def get_state(self) -> dict[str, Any]:
+        """Return serializable risk state for persistence."""
+        return {
+            "total_exposure": self.state.total_exposure,
+            "per_market_exposure": dict(self.state.per_market_exposure),
+            "per_strategy_exposure": dict(self.state.per_strategy_exposure),
+            "strategy_position_counts": dict(self._strategy_position_counts),
+            "peak_equity": self.state.peak_equity,
+            "consecutive_losses": self.state.consecutive_losses,
+            "circuit_breaker_active": self.state.circuit_breaker_tripped,
+            "current_drawdown_pct": self.state.current_drawdown_pct,
+        }
+
+    def restore_state(
+        self,
+        total_exposure: float = 0,
+        per_market: dict | None = None,
+        per_strategy: dict | None = None,
+        strat_counts: dict | None = None,
+        peak_equity: float = 0,
+        consecutive_losses: int = 0,
+        breaker_active: bool = False,
+    ) -> None:
+        """Restore risk state from persistence."""
+        self.state.total_exposure = total_exposure
+        if per_market:
+            self.state.per_market_exposure = dict(per_market)
+        if per_strategy:
+            self.state.per_strategy_exposure = dict(per_strategy)
+        if strat_counts:
+            self._strategy_position_counts = dict(strat_counts)
+        self.state.peak_equity = peak_equity
+        self.state.consecutive_losses = consecutive_losses
+        self.state.circuit_breaker_tripped = breaker_active
+        logger.info(
+            "risk_state_restored",
+            total_exposure=total_exposure,
+            peak_equity=peak_equity,
+            consecutive_losses=consecutive_losses,
+        )
+
     # --- Helpers ---
 
 

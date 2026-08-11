@@ -1,5 +1,5 @@
 # mypy: ignore-errors
-"""R9: SQLite paper persistence — same schema as PostgreSQL path."""
+"""R12: SQLite paper persistence — same schema as PostgreSQL path. Lease + closed trades."""
 
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS paper_orders(order_id TEXT PRIMARY KEY,client_order_i
 CREATE TABLE IF NOT EXISTS paper_fills(fill_id TEXT PRIMARY KEY,order_id TEXT,symbol TEXT,side TEXT,quantity REAL,price REAL,notional REAL,fees REAL DEFAULT 0,slippage_bps REAL DEFAULT 0,filled_at TEXT);
 CREATE TABLE IF NOT EXISTS paper_risk(id INTEGER PRIMARY KEY CHECK(id=1),total_exposure REAL DEFAULT 0,per_market TEXT DEFAULT '{}',per_strategy TEXT DEFAULT '{}',strat_counts TEXT DEFAULT '{}',peak_equity REAL DEFAULT 0,consecutive_losses INTEGER DEFAULT 0,breaker_active INTEGER DEFAULT 0,updated_at TEXT);
 CREATE TABLE IF NOT EXISTS paper_session(session_id TEXT PRIMARY KEY,commit_sha TEXT,started_at TEXT,ended_at TEXT,status TEXT DEFAULT 'STARTING');
-CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event_type TEXT,details TEXT,created_at TEXT);"""
+CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event_type TEXT,details TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS runtime_lease(account_id TEXT PRIMARY KEY,owner_id TEXT,acquired_at TEXT,heartbeat_at TEXT,expires_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_closed_trades(trade_id TEXT PRIMARY KEY,symbol TEXT,direction TEXT,entry_price REAL,exit_price REAL,quantity REAL,gross_pnl REAL,fees REAL,slippage_cost REAL,net_pnl REAL,return_pct REAL,exit_reason TEXT,strategy_id TEXT DEFAULT '',entry_time TEXT,exit_time TEXT,created_at TEXT);"""
 
 
 class PaperPersistence:
@@ -40,6 +42,14 @@ class PaperPersistence:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def _ensure_lease_table(self) -> None:
+        """Ensure the runtime_lease table exists (called by orchestrator)."""
+        if self._conn:
+            self._conn.executescript(
+                "CREATE TABLE IF NOT EXISTS runtime_lease(account_id TEXT PRIMARY KEY,owner_id TEXT,acquired_at TEXT,heartbeat_at TEXT,expires_at TEXT);"
+            )
+            self._conn.commit()
 
     @contextmanager
     def _tx(self):
@@ -247,3 +257,69 @@ class PaperPersistence:
                 "INSERT INTO audit_log(event_type,details,created_at) VALUES(?,?,?)",
                 (event, details, self._now()),
             )
+
+    # ── R12: CLOSED TRADES (durable) ──
+    def save_closed_trade(self, t: dict) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO paper_closed_trades(trade_id,symbol,direction,entry_price,exit_price,quantity,gross_pnl,fees,slippage_cost,net_pnl,return_pct,exit_reason,strategy_id,entry_time,exit_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    t["trade_id"],
+                    t["symbol"],
+                    t.get("direction", "long"),
+                    t["entry_price"],
+                    t["exit_price"],
+                    t["quantity"],
+                    t.get("gross_pnl", 0),
+                    t.get("fees", 0),
+                    t.get("slippage_cost", 0),
+                    t.get("net_pnl", 0),
+                    t.get("return_pct", 0),
+                    t.get("exit_reason", ""),
+                    t.get("strategy_id", ""),
+                    t.get("entry_time", self._now()),
+                    t.get("exit_time", self._now()),
+                    self._now(),
+                ),
+            )
+
+    def load_closed_trades(self) -> list[dict]:
+        if not self._conn:
+            return []
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM paper_closed_trades ORDER BY exit_time DESC"
+            ).fetchall()
+        ]
+
+    # ── R12: Order/fill idempotency checks ──
+    def order_id_exists(self, order_id: str) -> bool:
+        if not self._conn:
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM paper_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+            is not None
+        )
+
+    def fill_id_exists(self, fill_id: str) -> bool:
+        if not self._conn:
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM paper_fills WHERE fill_id=?", (fill_id,)
+            ).fetchone()
+            is not None
+        )
+
+    def closed_trade_exists(self, trade_id: str) -> bool:
+        if not self._conn:
+            return False
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM paper_closed_trades WHERE trade_id=?", (trade_id,)
+            ).fetchone()
+            is not None
+        )

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: T201
 """Safe Paper Trading Runner — deterministic replay-based paper trading.
 
 NO real orders. NO API keys.

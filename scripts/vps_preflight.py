@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: T201
 """R9: VPS Preflight — PUBLIC DATA ONLY. No trading. No API keys."""
 
 from __future__ import annotations

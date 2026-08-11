@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: T201
 """Run a backtest from the command line.
 
 Usage:
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.backtesting.engine import BacktestConfig, BacktestEngine, PeriodType
 
 
-def dummy_strategy(data: pd.DataFrame) -> dict | None:
+def dummy_strategy(data) -> dict | None:
     """Placeholder — replace with real strategy."""
 
     if len(data) < 20:

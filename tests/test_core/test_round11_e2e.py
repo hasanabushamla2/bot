@@ -163,8 +163,9 @@ class TestOrchPersistence:
             feat.spread_bps = 2.0
             feat.bid_ask_ratio = 1.2
         await orch._scan_tick()
-        acct = orch._persist.load_account()
-        # Account may or may not be saved depending on trade execution
+        loaded_acct = orch._persist.load_account()
+        # Account may or may not have persisted state depending on trade execution
+        assert loaded_acct is None or isinstance(loaded_acct, dict)
         orch._persist.close()
         orch.stop()
         os.unlink(db_path)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: T201
 """Live Market Data Demo — connects to Binance, subscribes to instruments,
 receives live data, maintains order books, computes metrics, displays summary.
 

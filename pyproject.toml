@@ -128,7 +128,7 @@ no_implicit_optional = true
 warn_no_return = true
 namespace_packages = true
 explicit_package_bases = true
-mypy_path = "src"
+mypy_path = "."
 exclude = [
     "migrations/",
     "build/",
