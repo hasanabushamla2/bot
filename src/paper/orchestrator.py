@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import deque
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from src.analytics.tracker import AnalyticsTracker
@@ -850,6 +851,8 @@ class PaperTradingOrchestrator:
         while self._running:
             await asyncio.sleep(self._report_interval)
             s = self.account.state
+            # Docker health heartbeat file
+            self._touch_heartbeat()
             logger.info(
                 "paper_status",
                 equity=round(s.equity, 0),
@@ -862,6 +865,16 @@ class PaperTradingOrchestrator:
                 persist_e=self._persistence_errors,
                 lease_ok=self._lease_heartbeat_success,
             )
+
+    def _touch_heartbeat(self) -> None:
+        """Write Docker healthcheck heartbeat file."""
+        try:
+            hb_dir = os.path.dirname(self._db_path)
+            hb_path = os.path.join(hb_dir, ".heartbeat")
+            Path(hb_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(hb_path).touch()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _get_bid(self, symbol: str) -> float:

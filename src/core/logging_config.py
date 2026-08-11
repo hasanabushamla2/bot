@@ -1,4 +1,4 @@
-"""Structured logging configuration.
+"""Structured logging configuration — R12: bounded file rotation.
 
 All log messages are structured JSON for machine readability.
 Secrets are automatically filtered — never print API keys in logs.
@@ -7,6 +7,7 @@ Secrets are automatically filtered — never print API keys in logs.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 from typing import Any
 
@@ -32,21 +33,42 @@ def _secrets_filter(_logger: Any, _method: Any, event_dict: dict[str, Any]) -> d
     return event_dict
 
 
-def setup_logging(level: str = "INFO", fmt: str = "json") -> None:
+def setup_logging(
+    level: str = "INFO",
+    fmt: str = "json",
+    log_dir: str = "logs",
+    max_bytes: int = 10 * 1024 * 1024,  # 10 MB
+    backup_count: int = 5,
+) -> None:
     """Configure structured logging for the entire application.
 
     Args:
         level: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         fmt: "json" for machine-readable or "text" for human-readable.
+        log_dir: Directory for rotating log files.
+        max_bytes: Max bytes per log file before rotation.
+        backup_count: Number of rotated backups to keep.
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
-    # Standard library logging compatibility
+    # Standard library logging compatibility — this sets up the root logger
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
         level=log_level,
+        force=True,
     )
+
+    # Now add the rotating file handler (after basicConfig, so it's not cleared)
+    root = logging.getLogger()
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=f"{log_dir}/engine.log",
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+    )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(file_handler)
 
     processors: list[Any] = [
         structlog.stdlib.filter_by_level,

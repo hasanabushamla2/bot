@@ -52,8 +52,14 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
 
 volumes:
   pgdata:
