@@ -42,16 +42,30 @@ async def _kucoin_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Ev
                                        "last_price": 0, "last_book_ts": None,
                                        "last_ticker_ts": None})
 
+    # R21: Fetch real 24h volume once at start, then every 60s
+    volume_cache: dict[str, float] = {}
+    volume_last_fetch = 0.0
+
     while not stop_event.is_set():
+        now_ts = __import__('time').monotonic()
+
+        if now_ts - volume_last_fetch > 60:
+            for raw in symbols:
+                stats = await adapter.get_24h_stats(raw)
+                if stats and stats.get("volume_24h_usd", 0) > 0:
+                    volume_cache[raw] = stats["volume_24h_usd"]
+            volume_last_fetch = now_ts
+
         for raw in symbols:
             if stop_event.is_set():
                 break
             s = SYMBOL_STATS[raw]
 
             t = await adapter.get_ticker(raw)
+            vol = volume_cache.get(raw, t.get("bid_size", 0) * 10000) if t else 10000
             if t and t.get("last", 0) > 0:
                 orch.process_ticker(raw, t["bid"], t["ask"], t["last"],
-                                    volume_24h=t.get("bid_size", 0) * 10000)
+                                    volume_24h=vol)
                 s["ticker"] += 1
                 s["last_bid"] = t["bid"]
                 s["last_ask"] = t["ask"]

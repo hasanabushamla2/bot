@@ -96,6 +96,32 @@ class KuCoinPublicAdapter:
         except Exception:
             return None
 
+    async def get_24h_stats(self, raw_symbol: str) -> dict[str, Any] | None:
+        """Get 24h statistics including real volume. Returns {volume_24h_usd, volume_24h_base, ...}."""
+        try:
+            if not self._http:
+                return None
+            r = await self._http.get(
+                f"/api/v1/market/stats?symbol={raw_symbol}"
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            if data.get("code") != "200000":
+                return None
+            d = data["data"]
+            vol_usd = float(d.get("volValue", 0) or 0)
+            vol_base = float(d.get("vol", 0) or 0)
+            return {
+                "volume_24h_base": vol_base,
+                "volume_24h_usd": vol_usd,
+                "high_24h": float(d.get("high", 0) or 0),
+                "low_24h": float(d.get("low", 0) or 0),
+                "change_pct": float(d.get("changeRate", 0) or 0) * 100,
+            }
+        except Exception:
+            return None
+
     async def get_server_time(self) -> datetime:
         try:
             if not self._http:

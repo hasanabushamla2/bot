@@ -213,6 +213,16 @@ class PaperTradingOrchestrator:
         self._fatal_error: str | None = None
         self._stale_feed_violation: bool = False
 
+        # R21: Strategy pipeline observability counters
+        self._strategy_evaluations: int = 0
+        self._strategy_evaluations_by_strategy: dict[str, int] = {}
+        self._strategy_evaluations_by_symbol: dict[str, int] = {}
+        self._no_signal_decisions: int = 0
+        self._no_signal_reasons: dict[str, int] = {}
+        self._market_events_received: int = 0
+        self._ticker_events_received: int = 0
+        self._book_events_received: int = 0
+
         try:
             signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
             signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
@@ -596,6 +606,8 @@ class PaperTradingOrchestrator:
     # ══════════════════════════════════════════════════════════════════
     async def _sub_ticker(self, event: Any) -> None:
         self.consume_count += 1
+        self._market_events_received += 1
+        self._ticker_events_received += 1
         sym = str(getattr(event, "symbol", ""))
         last = float(getattr(event, "last", 0))
         bid = float(getattr(event, "bid", last * 0.9999))
@@ -633,6 +645,7 @@ class PaperTradingOrchestrator:
         if asks:
             book.asks.apply_snapshot([BookLevel(p, q) for p, q in asks[:50]])
         book.last_update_time = datetime.now(UTC)
+        self._book_events_received += 1
         self.feed_health.record_message("binance", canonical, "book", exchange_ts=datetime.now(UTC))
 
     # ══════════════════════════════════════════════════════════════════
@@ -773,10 +786,46 @@ class PaperTradingOrchestrator:
             if feat.sample_count < 10:
                 continue
             for strat in self.registry.get_enabled():
+                self._strategy_evaluations += 1
+                sid = strat.strategy_id
+                self._strategy_evaluations_by_strategy[sid] = \
+                    self._strategy_evaluations_by_strategy.get(sid, 0) + 1
+                self._strategy_evaluations_by_symbol[canonical] = \
+                    self._strategy_evaluations_by_symbol.get(canonical, 0) + 1
                 try:
                     sig = await strat.analyze(features=feat)  # type: ignore[call-arg]
                     if sig and not sig.is_expired:
                         strategy_signals.append(sig)
+                    else:
+                        self._no_signal_decisions += 1
+                        # Determine the rejection reason
+                        if feat.sample_count < 20:
+                            reason = "insufficient_history"
+                        elif sid == "momentum_v1":
+                            if feat.momentum_5m <= 0 and feat.trend_strength <= 0:
+                                reason = "no_momentum"
+                            elif feat.trend_strength <= 0:
+                                reason = "no_trend"
+                            else:
+                                reason = "threshold_not_met"
+                        elif sid == "breakout_v1":
+                            if feat.relative_volume < 2.0:
+                                reason = "low_volume"
+                            elif feat.breakout_position_pct < 80:
+                                reason = "no_breakout"
+                            else:
+                                reason = "threshold_not_met"
+                        elif sid == "order_flow_v1":
+                            if feat.bid_ask_ratio < 1.2:
+                                reason = "balanced_book"
+                            elif feat.trade_flow_ratio < 1.5:
+                                reason = "neutral_flow"
+                            else:
+                                reason = "threshold_not_met"
+                        else:
+                            reason = "unknown"
+                        self._no_signal_reasons[reason] = \
+                            self._no_signal_reasons.get(reason, 0) + 1
                 except Exception:
                     self._exceptions += 1
         self._total_signals += len(strategy_signals)
@@ -900,6 +949,20 @@ class PaperTradingOrchestrator:
                 # R14 P-01: reconcile risk immediately after entry
                 self._reconcile_risk()
         self._total_scans += 1
+
+        # R21: Per-scan diagnostic
+        logger.info(
+            "strategy_diagnostic",
+            scan=self._total_scans,
+            evaluations=self._strategy_evaluations,
+            by_strategy=self._strategy_evaluations_by_strategy.copy(),
+            signals=self._total_signals,
+            no_signal=self._no_signal_decisions,
+            no_signal_reasons=self._no_signal_reasons.copy(),
+            market_events=self._market_events_received,
+            ticker=self._ticker_events_received,
+            book=self._book_events_received,
+        )
 
         # Persist trail state at runtime
         for sym in list(self.account.state.open_positions.keys()):
