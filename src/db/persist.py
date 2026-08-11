@@ -293,6 +293,23 @@ class PaperPersistence:
             ).fetchall()
         ]
 
+    # ── R14: Bounded recent closed trades query ──
+    def load_recent_closed_trades(self, limit: int = 200) -> list[dict]:
+        if not self._conn:
+            return []
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM paper_closed_trades ORDER BY exit_time DESC LIMIT ?", (limit,)
+            ).fetchall()
+        ]
+
+    def count_closed_trades(self) -> int:
+        if not self._conn:
+            return 0
+        r = self._conn.execute("SELECT COUNT(*) as cnt FROM paper_closed_trades").fetchone()
+        return r["cnt"] if r else 0
+
     # ── R12: Order/fill idempotency checks ──
     def order_id_exists(self, order_id: str) -> bool:
         if not self._conn:

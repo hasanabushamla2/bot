@@ -1,7 +1,8 @@
-"""Paper Account — complete simulated portfolio accounting for paper trading."""
+"""Paper Account — R14: bounded memory, explicit slippage fixed, hard stop anchored."""
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 from src.core.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+CLOSED_TRADE_RAM_LIMIT = 500
 
 
 @dataclass
@@ -69,7 +72,9 @@ class PaperAccountState:
     daily_start_equity: float = 10_000.0
     daily_pnl: float = 0.0
     open_positions: dict[str, PaperPosition] = field(default_factory=dict)
-    closed_trades: list[ClosedTrade] = field(default_factory=list)
+    closed_trades: deque[ClosedTrade] = field(
+        default_factory=lambda: deque(maxlen=CLOSED_TRADE_RAM_LIMIT)
+    )
     trade_count: int = 0
     win_count: int = 0
     loss_count: int = 0
@@ -105,7 +110,6 @@ class PaperAccount:
         opportunity_id: str = "",
     ) -> PaperPosition | None:
         notional = entry_price * quantity
-        # N-12: Reject duplicate same-symbol position
         if symbol in self.state.open_positions:
             logger.warning("paper_duplicate_blocked", symbol=symbol)
             return None
@@ -156,7 +160,8 @@ class PaperAccount:
         else:
             gross = (pos.entry_price - exit_price) * pos.quantity
         net = gross - fees - slippage - pos.fees_paid
-        self.state.cash += exit_notional - fees
+        # R14 A-01: cash subtracts BOTH fees AND slippage
+        self.state.cash += exit_notional - fees - slippage
         self.state.realized_pnl += net
         self.state.trade_count += 1
         if net > 0:
@@ -189,23 +194,14 @@ class PaperAccount:
             strategy_id=pos.strategy_id,
         )
         self.state.closed_trades.append(trade)
-        # R11: Recompute unrealized PnL from remaining positions
         self.state.unrealized_pnl = sum(
             p.unrealized_pnl for p in self.state.open_positions.values()
         )
-        eq = self.state.equity
-        if eq > self.state.peak_equity:
-            self.state.peak_equity = eq
-        if self.state.peak_equity > 0:
-            dd = (self.state.peak_equity - eq) / self.state.peak_equity * 100
-            if dd > self.state.max_drawdown_pct:
-                self.state.max_drawdown_pct = dd
+        self._update_peak_and_drawdown()
         logger.info(
             "paper_position_closed",
-            symbol=symbol,
-            reason=exit_reason,
-            net_pnl=round(net, 2),
-            return_pct=round(return_pct, 4),
+            symbol=symbol, reason=exit_reason,
+            net_pnl=round(net, 2), return_pct=round(return_pct, 4),
         )
         return trade
 
@@ -218,7 +214,6 @@ class PaperAccount:
         slippage: float = 0.0,
         exit_reason: str = "partial",
     ) -> ClosedTrade | None:
-        """Reduce position quantity without fully closing. BLOCKER 6 fix."""
         pos = self.state.open_positions.get(symbol)
         if pos is None:
             return None
@@ -227,18 +222,15 @@ class PaperAccount:
             return None
         exit_notional = exit_price * actual_sell
         ratio = actual_sell / pos.quantity if pos.quantity > 0 else 1.0
-        # P&L for the sold portion
         gross = (exit_price - pos.entry_price) * actual_sell
         partial_fees = fees + (pos.fees_paid * ratio)
         net = gross - partial_fees - slippage
-        # Update position
         pos.quantity -= actual_sell
         pos.notional = pos.entry_price * pos.quantity
         pos.fees_paid *= 1.0 - ratio
-        # Update account
         self.state.allocated -= pos.entry_price * actual_sell
-        # R11: Recompute unrealized after reduction
-        self.state.cash += exit_notional - fees
+        # R14 A-01: cash subtracts BOTH fees AND slippage
+        self.state.cash += exit_notional - fees - slippage
         self.state.total_fees += fees
         self.state.total_slippage += slippage
         self.state.realized_pnl += net
@@ -249,33 +241,30 @@ class PaperAccount:
             self.state.loss_count += 1
         return_pct = (net / (pos.entry_price * actual_sell) * 100) if pos.entry_price > 0 else 0.0
         trade = ClosedTrade(
-            symbol=symbol,
-            direction=pos.direction,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            quantity=actual_sell,
-            gross_pnl=gross,
-            fees=partial_fees,
-            slippage_cost=slippage,
-            net_pnl=net,
-            return_pct=return_pct,
-            exit_reason=exit_reason,
-            target_stop=pos.stop_loss_price,
-            actual_exit=exit_price,
-            stop_slippage_pct=0.0,
-            entry_time=pos.entry_time,
-            exit_time=datetime.now(UTC),
+            symbol=symbol, direction=pos.direction,
+            entry_price=pos.entry_price, exit_price=exit_price,
+            quantity=actual_sell, gross_pnl=gross, fees=partial_fees,
+            slippage_cost=slippage, net_pnl=net, return_pct=return_pct,
+            exit_reason=exit_reason, target_stop=pos.stop_loss_price,
+            actual_exit=exit_price, stop_slippage_pct=0.0,
+            entry_time=pos.entry_time, exit_time=datetime.now(UTC),
             strategy_id=pos.strategy_id,
         )
         self.state.closed_trades.append(trade)
-        # If fully closed, remove position
         if pos.quantity <= 0:
             del self.state.open_positions[symbol]
-        # R11: Recompute unrealized PnL from remaining positions
         self.state.unrealized_pnl = sum(
             p.unrealized_pnl for p in self.state.open_positions.values()
         )
-        # Update drawdown
+        self._update_peak_and_drawdown()
+        logger.info(
+            "paper_position_reduced",
+            symbol=symbol, sold=round(actual_sell, 6),
+            remaining=round(pos.quantity, 6), pnl=round(net, 4),
+        )
+        return trade
+
+    def _update_peak_and_drawdown(self) -> None:
         eq = self.state.equity
         if eq > self.state.peak_equity:
             self.state.peak_equity = eq
@@ -283,14 +272,6 @@ class PaperAccount:
             dd = (self.state.peak_equity - eq) / self.state.peak_equity * 100
             if dd > self.state.max_drawdown_pct:
                 self.state.max_drawdown_pct = dd
-        logger.info(
-            "paper_position_reduced",
-            symbol=symbol,
-            sold=round(actual_sell, 6),
-            remaining=round(pos.quantity, 6),
-            pnl=round(net, 4),
-        )
-        return trade
 
     def update_market_price(self, symbol: str, price: float) -> None:
         pos = self.state.open_positions.get(symbol)
@@ -319,16 +300,14 @@ class PaperAccount:
     def summary(self) -> dict[str, Any]:
         s = self.state
         return {
-            "equity": round(s.equity, 2),
-            "cash": round(s.cash, 2),
+            "equity": round(s.equity, 2), "cash": round(s.cash, 2),
             "allocated": round(s.allocated, 2),
             "unrealized_pnl": round(s.unrealized_pnl, 2),
             "realized_pnl": round(s.realized_pnl, 2),
             "total_fees": round(s.total_fees, 4),
             "total_slippage": round(s.total_slippage, 4),
             "trade_count": s.trade_count,
-            "win_count": s.win_count,
-            "loss_count": s.loss_count,
+            "win_count": s.win_count, "loss_count": s.loss_count,
             "win_rate": s.win_count / s.trade_count if s.trade_count > 0 else 0.0,
             "open_positions": len(s.open_positions),
             "max_drawdown_pct": round(s.max_drawdown_pct, 2),

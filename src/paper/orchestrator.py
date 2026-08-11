@@ -1,10 +1,11 @@
-"""Paper Trading Orchestrator — ROUND 13: all 24 blockers closed."""
+"""Paper Trading Orchestrator — ROUND 14: 9-blocker evidence closure."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import os
+import resource
 import signal
 import time
 import uuid
@@ -22,7 +23,7 @@ from src.data.order_book import OrderBookEngine
 from src.db.persist import PaperPersistence
 from src.features.engine import FeatureEngine
 from src.opportunity.engine import OpportunityEngine
-from src.paper.account import ClosedTrade, PaperAccount, PaperPosition
+from src.paper.account import CLOSED_TRADE_RAM_LIMIT, ClosedTrade, PaperAccount, PaperPosition
 from src.paper.engine import PaperExecutionEngine
 from src.paper.position_monitor import PositionMonitor
 from src.portfolio.allocator import AllocatorConfig, CapitalAllocator, PortfolioState
@@ -45,8 +46,6 @@ LEASE_EXPIRY_SEC = 45.0
 
 
 class _RuntimeLease:
-    """R13: Atomic lease acquisition via BEGIN IMMEDIATE."""
-
     def __init__(self, persist: PaperPersistence, account_id: str, owner_id: str) -> None:
         self._persist = persist
         self._account_id = account_id
@@ -54,11 +53,9 @@ class _RuntimeLease:
         self._acquired = False
 
     def try_acquire(self) -> bool:
-        """R13: Atomic lease acquisition using BEGIN IMMEDIATE."""
         if self._persist._conn is None:
             return False
         with self._persist._tx() as c:
-            # SQLite: BEGIN IMMEDIATE taken before SELECT prevents races
             c.execute("BEGIN IMMEDIATE")
             now = datetime.now(UTC).isoformat()
             row = c.execute(
@@ -106,7 +103,7 @@ class _RuntimeLease:
 
 
 class PaperTradingOrchestrator:
-    """Round 13: all 24 auditor blockers closed."""
+    """Round 14: 9-blocker closure."""
 
     def __init__(
         self,
@@ -149,22 +146,14 @@ class PaperTradingOrchestrator:
         self.publish_count = 0
         self.consume_count = 0
         self.subscriber_count = 0
-
-        self._trade_log: deque[dict[str, Any]] = deque(maxlen=50000)
-        self._error_log: deque[dict[str, Any]] = deque(maxlen=1000)
         self._accepting_new = False
         self._health_recovery_counter: dict[str, int] = {}
-
-        try:
-            signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
-            signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
-        except Exception:
-            pass
 
         self._running = False
         self._scan_interval = 5.0
         self._report_interval = 60.0
         self._start_time = 0.0
+        self._wall_start: datetime | None = None
         self._total_scans = 0
         self._total_signals = 0
         self._total_trades = 0
@@ -185,13 +174,34 @@ class PaperTradingOrchestrator:
         self._persistence_errors = 0
         self._exceptions = 0
 
+        self._rss_start_mb: float = 0.0
+        self._rss_peak_mb: float = 0.0
+        self._task_count_start: int = 0
+        self._task_count_peak: int = 0
+        self._queue_depth_peak: int = 0
+        self._db_bytes_start: int = 0
+        self._trade_log: deque[dict[str, Any]] = deque(maxlen=50000)
+        self._error_log: deque[dict[str, Any]] = deque(maxlen=1000)
+
+        # R14: closed-trade dedup set to prevent re-persistence
+        self._persisted_trade_ids: set[str] = set()
+
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal())
+            signal.signal(signal.SIGINT, lambda s, f: self._handle_signal())
+        except Exception:
+            pass
+
     # ══════════════════════════════════════════════════════════════════
     async def start(self, duration_seconds: float = 0.0) -> dict[str, Any]:
         logger.info("paper_start", balance=self.initial_balance)
+        self._wall_start = datetime.now(UTC)
+        self._sample_resources_start()
 
         self._persist = PaperPersistence(self._db_path)
         self._persist.connect()
         self._persist._ensure_lease_table()
+        self._db_bytes_start = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
 
         session_id = self._get_experiment_id()
         owner_id = f"{session_id}-{uuid.uuid4().hex[:8]}"
@@ -230,6 +240,7 @@ class PaperTradingOrchestrator:
         end = time.monotonic() + duration_seconds if duration_seconds > 0 else float("inf")
         try:
             while self._running and time.monotonic() < end:
+                self._sample_resource_peak()
                 await asyncio.sleep(0.5)
         except KeyboardInterrupt:
             pass
@@ -248,7 +259,30 @@ class PaperTradingOrchestrator:
         return self._final_report()
 
     # ══════════════════════════════════════════════════════════════════
-    #  R13: Startup state restore with closed trades restore
+    def _sample_resources_start(self) -> None:
+        try:
+            r = resource.getrusage(resource.RUSAGE_SELF)
+            self._rss_start_mb = r.ru_maxrss / 1024.0
+        except Exception:
+            self._rss_start_mb = 0.0
+        self._task_count_start = len(asyncio.all_tasks())
+
+    def _sample_resource_peak(self) -> None:
+        try:
+            r = resource.getrusage(resource.RUSAGE_SELF)
+            mb = r.ru_maxrss / 1024.0
+            if mb > self._rss_peak_mb:
+                self._rss_peak_mb = mb
+            tc = len(asyncio.all_tasks())
+            if tc > self._task_count_peak:
+                self._task_count_peak = tc
+            for name in self.event_bus._consumers:
+                qsize = self.event_bus._consumers[name].qsize() if name in self.event_bus._consumers else 0
+                if qsize > self._queue_depth_peak:
+                    self._queue_depth_peak = qsize
+        except Exception:
+            pass
+
     # ══════════════════════════════════════════════════════════════════
     def _restore_state(self) -> None:
         if self._persist is None:
@@ -265,35 +299,26 @@ class PaperTradingOrchestrator:
             s.win_count = saved.get("win_count", 0)
             s.loss_count = saved.get("loss_count", 0)
             s.peak_equity = saved.get("peak_equity", self.initial_balance)
-            logger.info("state_restored_account", cash=s.cash)
 
-        # R13: Restore closed trades into RAM (bounded recent history)
-        db_trades = self._persist.load_closed_trades()
-        for t_dict in db_trades[:200]:  # bounded
+        # R14 M-01: Bounded recent closed trades from DB (SQL LIMIT)
+        db_trades = self._persist.load_recent_closed_trades(200)
+        for t_dict in db_trades:
             ct = ClosedTrade(
-                symbol=t_dict["symbol"],
-                direction=t_dict.get("direction", "long"),
-                entry_price=t_dict["entry_price"],
-                exit_price=t_dict["exit_price"],
-                quantity=t_dict["quantity"],
-                gross_pnl=t_dict.get("gross_pnl", 0),
-                fees=t_dict.get("fees", 0),
-                slippage_cost=t_dict.get("slippage_cost", 0),
-                net_pnl=t_dict.get("net_pnl", 0),
-                return_pct=t_dict.get("return_pct", 0),
+                symbol=t_dict["symbol"], direction=t_dict.get("direction", "long"),
+                entry_price=t_dict["entry_price"], exit_price=t_dict["exit_price"],
+                quantity=t_dict["quantity"], gross_pnl=t_dict.get("gross_pnl", 0),
+                fees=t_dict.get("fees", 0), slippage_cost=t_dict.get("slippage_cost", 0),
+                net_pnl=t_dict.get("net_pnl", 0), return_pct=t_dict.get("return_pct", 0),
                 exit_reason=t_dict.get("exit_reason", ""),
                 strategy_id=t_dict.get("strategy_id", ""),
             )
             self.account.state.closed_trades.append(ct)
 
-        # R13: Restore positions — register_position first, THEN restore trail
         positions = self._persist.load_open_positions()
         for p_dict in positions:
             pos = PaperPosition(
-                symbol=p_dict["symbol"],
-                direction=p_dict.get("direction", "long"),
-                entry_price=p_dict["entry_price"],
-                quantity=p_dict["quantity"],
+                symbol=p_dict["symbol"], direction=p_dict.get("direction", "long"),
+                entry_price=p_dict["entry_price"], quantity=p_dict["quantity"],
                 notional=p_dict.get("entry_notional", p_dict["entry_price"] * p_dict["quantity"]),
                 stop_loss_price=p_dict.get("stop_loss_price", 0),
                 fees_paid=p_dict.get("entry_fee", 0),
@@ -301,26 +326,20 @@ class PaperTradingOrchestrator:
             )
             self.account.state.open_positions[p_dict["symbol"]] = pos
             self.monitor.register_position(pos)
-
-            # R13 FIX: now restore trail AFTER register_position to avoid overwrite
             trail = self._persist.load_trail(p_dict["position_id"])
             if trail:
-                saved_trail = {
-                    "symbol": p_dict["symbol"],
-                    "direction": p_dict.get("direction", "long"),
+                self.monitor.restore_trail_state({
+                    "symbol": p_dict["symbol"], "direction": p_dict.get("direction", "long"),
                     "entry_price": p_dict["entry_price"],
                     "peak_price": trail.get("trail_peak", p_dict["entry_price"]),
                     "trail_level": trail.get("trail_level", 0),
                     "activated": bool(trail.get("trail_activated")),
                     "exit_intent": bool(trail.get("exit_intent_active")),
-                }
-                self.monitor.restore_trail_state(saved_trail)
-                # Apply trail state to position
+                })
                 pos.trail_peak = trail.get("trail_peak", p_dict["entry_price"])
                 pos.trail_activated = bool(trail.get("trail_activated"))
                 pos.trail_level = trail.get("trail_level", 0)
 
-        # Restore risk
         risk = self._persist.load_risk()
         if risk:
             self.risk_engine.restore_state(
@@ -338,8 +357,6 @@ class PaperTradingOrchestrator:
         )
 
     # ══════════════════════════════════════════════════════════════════
-    #  R13: Health supervisor with recovery
-    # ══════════════════════════════════════════════════════════════════
     async def _health_supervisor(self) -> None:
         stabilization_ticks = 3
         while self._running:
@@ -349,18 +366,15 @@ class PaperTradingOrchestrator:
             if all_feeds and all(not f.is_healthy for f in all_feeds):
                 self._accepting_new = False
                 self._health_recovery_counter.clear()
-                logger.error("all_feeds_unhealthy_closing_gate")
             elif unhealthy:
                 for fh in unhealthy:
                     logger.warning("feed_unhealthy", symbol=fh.symbol, stream=fh.stream_type)
             else:
-                # All feeds healthy — allow recovery after stabilization
                 if not self._accepting_new and self._lease and self._running:
                     key = "global"
                     self._health_recovery_counter[key] = self._health_recovery_counter.get(key, 0) + 1
                     if self._health_recovery_counter[key] >= stabilization_ticks:
                         self._accepting_new = True
-                        logger.info("health_recovered_gate_reopened")
                         self._health_recovery_counter.clear()
 
     async def _lease_heartbeat_loop(self) -> None:
@@ -373,8 +387,45 @@ class PaperTradingOrchestrator:
                 self._lease_heartbeat_success += 1
 
     # ══════════════════════════════════════════════════════════════════
-    #  R13: Persistence helpers with order/fill memory
-    # ══════════════════════════════════════════════════════════════════
+    def _reconcile_risk(self) -> None:
+        """R14 P-01: Reconcile risk state from current account positions immediately."""
+        exp = self.account.state.allocated
+        strat_counts: dict[str, int] = {}
+        per_strat: dict[str, float] = {}
+        for pos in self.account.state.open_positions.values():
+            sid = pos.strategy_id or "unknown"
+            strat_counts[sid] = strat_counts.get(sid, 0) + 1
+            per_strat[sid] = per_strat.get(sid, 0) + pos.notional
+        self.risk_engine.update_state(
+            total_exposure=exp,
+            current_equity=self.account.state.equity,
+            open_positions_count=len(self.account.state.open_positions),
+            per_market_exposure={"crypto": exp},
+            per_strategy_exposure=per_strat,
+            strategy_position_counts=strat_counts,
+        )
+        self._persist_risk_data(exp, per_strat, strat_counts)
+
+    def _persist_risk_data(
+        self, exp: float, per_strat: dict, strat_counts: dict
+    ) -> None:
+        if self._persist is None:
+            return
+        try:
+            rs = self.risk_engine.get_state()
+            self._persist.save_risk({
+                "total_exposure": exp,
+                "per_market_exposure": {"crypto": exp},
+                "per_strategy_exposure": per_strat,
+                "strategy_position_counts": strat_counts,
+                "peak_equity": max(rs.get("peak_equity", 0), self.account.state.peak_equity),
+                "consecutive_losses": rs.get("consecutive_losses", 0),
+                "circuit_breaker_active": rs.get("circuit_breaker_active", False),
+            })
+            self._persistence_writes += 1
+        except Exception:
+            self._persistence_errors += 1
+
     def _persist_account(self) -> None:
         if self._persist is None:
             return
@@ -427,32 +478,6 @@ class PaperTradingOrchestrator:
         except Exception:
             self._persistence_errors += 1
 
-    def _persist_risk(self) -> None:
-        if self._persist is None:
-            return
-        try:
-            rs = self.risk_engine.get_state()
-            # R13: Ensure exposure reflects actual open positions
-            exp = self.account.state.allocated
-            strat_counts: dict[str, int] = {}
-            per_strat: dict[str, float] = {}
-            for pos in self.account.state.open_positions.values():
-                sid = pos.strategy_id or "unknown"
-                strat_counts[sid] = strat_counts.get(sid, 0) + 1
-                per_strat[sid] = per_strat.get(sid, 0) + pos.notional
-            self._persist.save_risk({
-                "total_exposure": exp,
-                "per_market_exposure": {"crypto": exp},
-                "per_strategy_exposure": per_strat,
-                "strategy_position_counts": strat_counts,
-                "peak_equity": max(rs.get("peak_equity", 0), self.account.state.peak_equity),
-                "consecutive_losses": rs.get("consecutive_losses", 0),
-                "circuit_breaker_active": rs.get("circuit_breaker_active", False),
-            })
-            self._persistence_writes += 1
-        except Exception:
-            self._persistence_errors += 1
-
     def _persist_order(self, o: dict) -> None:
         if self._persist is None:
             return
@@ -476,11 +501,17 @@ class PaperTradingOrchestrator:
             self._persistence_errors += 1
 
     def _persist_closed_trade(self, trade: ClosedTrade) -> None:
+        """R14 P-02: Deterministic ID, dedup via in-memory set + DB check."""
         if self._persist is None:
             return
-        # R13: Deterministic trade_id — no random suffix
-        trade_id = f"ct-{trade.symbol}-{trade.exit_time.strftime('%Y%m%d%H%M%S')}-{trade.entry_price:.0f}-{trade.exit_price:.0f}"
+        trade_id = (
+            f"ct-{trade.symbol}-{trade.exit_time.strftime('%Y%m%d%H%M%S%f')[:16]}"
+            f"-{trade.entry_price:.2f}-{trade.exit_price:.2f}-{trade.quantity:.6f}"
+        )
+        if trade_id in self._persisted_trade_ids:
+            return
         if self._persist.closed_trade_exists(trade_id):
+            self._persisted_trade_ids.add(trade_id)
             return
         try:
             self._persist.save_closed_trade({
@@ -493,6 +524,7 @@ class PaperTradingOrchestrator:
                 "entry_time": trade.entry_time.isoformat(),
                 "exit_time": trade.exit_time.isoformat(),
             })
+            self._persisted_trade_ids.add(trade_id)
             self._persistence_writes += 1
         except Exception:
             self._persistence_errors += 1
@@ -506,8 +538,8 @@ class PaperTradingOrchestrator:
                 pid = f"pos-{sym}"
                 self._persist_position(pid, pos)
                 self._persist_trail(pid)
-            self._persist_risk()
-            # R13: Persist closed trades only if not already persisted (idempotency)
+            self._reconcile_risk()
+            # R14 P-02: Only persist trades not already persisted
             for trade in self.account.state.closed_trades:
                 self._persist_closed_trade(trade)
             self._persist.audit("GRACEFUL_SHUTDOWN", "Clean stop")
@@ -521,8 +553,6 @@ class PaperTradingOrchestrator:
                 return sym
         return ""
 
-    # ══════════════════════════════════════════════════════════════════
-    #  R13: Event bus subscriber — ticker only (book is separate)
     # ══════════════════════════════════════════════════════════════════
     async def _sub_ticker(self, event: Any) -> None:
         self.consume_count += 1
@@ -540,9 +570,6 @@ class PaperTradingOrchestrator:
         self.account.update_market_price(sym, last)
         self.analytics.record_equity(self.account.state.equity)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  R13: Public ingestion — ticker + order book
-    # ══════════════════════════════════════════════════════════════════
     def process_ticker(
         self, raw_symbol: str, bid: float, ask: float, last: float, volume_24h: float = 0.0
     ) -> None:
@@ -559,7 +586,6 @@ class PaperTradingOrchestrator:
     def process_order_book(
         self, raw_symbol: str, bids: list[tuple[float, float]], asks: list[tuple[float, float]]
     ) -> None:
-        """R13: Ingest real order-book depth into OrderBookEngine."""
         canonical = self._raw_to_canonical.get(raw_symbol.upper(), raw_symbol.upper())
         book = self.order_book_engine.get_or_create("binance", canonical)
         if bids:
@@ -570,13 +596,11 @@ class PaperTradingOrchestrator:
         self.feed_health.record_message("binance", canonical, "book", exchange_ts=datetime.now(UTC))
 
     # ══════════════════════════════════════════════════════════════════
-    #  R13: Scan/trade cycle — real depth, trail persistence, order/fill
-    # ══════════════════════════════════════════════════════════════════
     async def _scan_tick(self) -> None:
         if not self._accepting_new:
             return
 
-        # 1. Check stops/trails — use real book depth for exits
+        # 1. Check stops/trails
         exits = self.monitor.check_all()
         for ex in exits:
             sym = ex["symbol"]
@@ -596,11 +620,11 @@ class PaperTradingOrchestrator:
             if fill is None or fill.filled_qty <= 0:
                 continue
 
-            # R13: Persist order + fill
+            # R14 D-01: requested_qty = qty (immutable, captured before await)
             self._persist_order({
                 "order_id": order_id, "client_order_id": order_id,
                 "symbol": sym, "side": "sell", "requested_qty": qty,
-                "filled_qty": fill.filled_qty, "remaining_qty": fill.remaining_qty,
+                "filled_qty": fill.filled_qty, "remaining_qty": max(qty - fill.filled_qty, 0),
                 "avg_fill_price": fill.fill_price, "status": fill.status,
             })
             self._orders_created += 1
@@ -631,7 +655,6 @@ class PaperTradingOrchestrator:
                     sym, fill.fill_price, fill.filled_qty,
                     fees=fill.fees, slippage=0.0, exit_reason=ex["reason"],
                 )
-                self._positions_closed += 0
                 if sym in self.account.state.open_positions:
                     self.monitor.rearm_position(sym)
 
@@ -654,8 +677,8 @@ class PaperTradingOrchestrator:
                         self._persist_position(pid, self.account.state.open_positions[sym])
                     else:
                         self._persist.delete_position(pid)
-                # R13: Persist risk after exit
-                self._persist_risk()
+                # R14 P-01: reconcile risk immediately after exit
+                self._reconcile_risk()
 
         # 2. Build snapshots
         snapshots: list[AssetSnapshot] = []
@@ -663,12 +686,10 @@ class PaperTradingOrchestrator:
             feat = self.features.get(canonical)
             if feat.sample_count < 10:
                 continue
-            # R13: Check both ticker AND book health
             ticker_health = self.feed_health.get("binance", canonical, "ticker")
             book_health = self.feed_health.get("binance", canonical, "book")
             if ticker_health and not ticker_health.is_healthy:
                 continue
-            # Book health gate (only if book feed registered)
             if book_health and not book_health.is_healthy:
                 continue
             asset = self.universe.get(canonical, "binance")
@@ -728,7 +749,7 @@ class PaperTradingOrchestrator:
         if not opportunities:
             return
 
-        # 5. Risk — R13: update state with real position data
+        # 5. Risk update from state
         self.risk_engine.update_state(
             total_exposure=self.account.state.allocated,
             current_equity=self.account.state.equity,
@@ -757,6 +778,7 @@ class PaperTradingOrchestrator:
                 continue
             if sym in self.account.state.open_positions:
                 continue
+
             feat = self.features.get(sym)
             cap = PositionCapacity(
                 symbol=sym, strategy_id=opp.signal.strategy_id,
@@ -770,26 +792,28 @@ class PaperTradingOrchestrator:
             if pos_size < 50:
                 continue
 
-            # R13: Use real asks-depth for BUY execution
             book = self.order_book_engine.get_book("binance", sym)
             asks_depth = ([(lv[0], lv[1]) for lv in book.asks.levels[:20]] if book and book.asks else None)
-            bids_depth = ([(lv[0], lv[1]) for lv in book.bids.levels[:20]] if book and book.bids else None)
+
+            # R14 D-01: Capture requested_qty from immutable values BEFORE await
+            requested_qty = pos_size / max(feat.ask, 0.01)
 
             entry_fill = await self.paper_exec.simulate_fill(
-                sym, "buy", pos_size / max(feat.ask, 0.01),
+                sym, "buy", requested_qty,
                 bid=feat.bid, ask=feat.ask, last=feat.last_price,
-                asks_depth=asks_depth, bids_depth=bids_depth,
+                asks_depth=asks_depth,
             )
             if not entry_fill or entry_fill.filled_qty <= 0:
                 continue
 
             order_id = f"entry-{sym}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            # R14 D-01: Use captured requested_qty, not recomputed from feat
             self._persist_order({
                 "order_id": order_id, "client_order_id": order_id,
                 "symbol": sym, "side": "buy",
-                "requested_qty": pos_size / max(feat.ask, 0.01),
+                "requested_qty": requested_qty,
                 "filled_qty": entry_fill.filled_qty,
-                "remaining_qty": entry_fill.remaining_qty,
+                "remaining_qty": max(requested_qty - entry_fill.filled_qty, 0),
                 "avg_fill_price": entry_fill.fill_price,
                 "status": entry_fill.status,
             })
@@ -807,9 +831,14 @@ class PaperTradingOrchestrator:
                 self._partial_fills += 1
 
             quantity = entry_fill.filled_qty
+            fill_price = entry_fill.fill_price
+
+            # R14 S-01: Anchor hard stop to ACTUAL entry fill
+            hard_stop = fill_price * (1.0 - 0.003)  # exactly -0.30%
+
             pos = self.account.open_position(
-                sym, "long", entry_fill.fill_price, quantity,
-                fees=entry_fill.fees, stop_loss_price=risk.stop_loss_price,
+                sym, "long", fill_price, quantity,
+                fees=entry_fill.fees, stop_loss_price=hard_stop,
                 strategy_id=opp.signal.strategy_id,
             )
             if pos:
@@ -818,19 +847,20 @@ class PaperTradingOrchestrator:
                 self._total_trades += 1
                 self.analytics.record_allocation(
                     sym, opp.signal.strategy_id, "binance",
-                    entry_fill.fill_price * quantity,
+                    fill_price * quantity,
                 )
                 self._trade_log.append({
                     "symbol": sym, "side": "buy",
-                    "notional": entry_fill.fill_price * quantity,
+                    "notional": fill_price * quantity,
                     "time": datetime.now(UTC).isoformat(),
                 })
                 self._persist_position(pos_id, pos)
                 self._persist_account()
-                self._persist_risk()
+                # R14 P-01: reconcile risk immediately after entry
+                self._reconcile_risk()
         self._total_scans += 1
 
-        # R13: Persist trail state at runtime on every scan (not just shutdown)
+        # Persist trail state at runtime
         for sym in list(self.account.state.open_positions.keys()):
             self._persist_trail(f"pos-{sym}")
 
@@ -849,7 +879,7 @@ class PaperTradingOrchestrator:
         while self._running:
             await asyncio.sleep(self._report_interval)
             self._touch_heartbeat()
-            self._persist_risk()
+            self._sample_resource_peak()
             s = self.account.state
             logger.info("paper_status", equity=round(s.equity, 0), pnl=round(s.realized_pnl, 0),
                         positions=len(s.open_positions), trades=s.trade_count,
@@ -866,15 +896,17 @@ class PaperTradingOrchestrator:
         feat = self.features.get(symbol)
         return feat.bid if feat.bid > 0 else 0.0
 
-    def _get_ask(self, symbol: str) -> float:
-        feat = self.features.get(symbol)
-        return feat.ask if feat.ask > 0 else 0.0
-
     def _final_report(self) -> dict[str, Any]:
         s = self.account.state
+        wall_secs = (datetime.now(UTC) - self._wall_start).total_seconds() if self._wall_start else 0
+        try:
+            rss_now = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        except Exception:
+            rss_now = 0.0
         return {
             "status": "complete",
             "duration_seconds": time.monotonic() - self._start_time,
+            "wall_seconds": wall_secs,
             "initial_balance": self.initial_balance,
             "final_equity": round(s.equity, 2),
             "net_pnl": round(s.realized_pnl, 2),
@@ -882,9 +914,7 @@ class PaperTradingOrchestrator:
             "total_slippage": round(s.total_slippage, 4),
             "total_trades": s.trade_count,
             "wins": s.win_count, "losses": s.loss_count,
-            "win_rate": s.win_count / s.trade_count if s.trade_count else 0,
             "total_signals": self._total_signals,
-            "total_scans": self._total_scans,
             "total_opportunities": self._total_opportunities,
             "risk_assessments": self._risk_assessments,
             "risk_approved": self._risk_approved,
@@ -903,6 +933,15 @@ class PaperTradingOrchestrator:
             "lease_heartbeat_success": self._lease_heartbeat_success,
             "lease_heartbeat_errors": self._lease_heartbeat_errors,
             "exceptions": self._exceptions,
+            "closed_trade_ram": len(self.account.state.closed_trades),
+            "closed_trade_ram_limit": CLOSED_TRADE_RAM_LIMIT,
+            "rss_start_mb": self._rss_start_mb,
+            "rss_peak_mb": self._rss_peak_mb,
+            "rss_end_mb": rss_now,
+            "task_count_start": self._task_count_start,
+            "task_count_peak": self._task_count_peak,
+            "task_count_end": len(asyncio.all_tasks()),
+            "queue_depth_peak": self._queue_depth_peak,
             "mode": "PAPER", "live_trading": "DISABLED",
         }
 

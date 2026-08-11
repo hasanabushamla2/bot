@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""R13: Soak Harness — REAL replay feed with order-book depth. PAPER ONLY."""
+"""R14: Soak Harness — real orchestrator.start() with background feed. PAPER ONLY."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ import json
 import math
 import os
 import sys
+import time as time_module
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,9 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def _generate_replay_feed(symbols: list[str], ticks: int):
-    """Deterministic replay: synthetic prices with multi-level order books."""
-    base_prices = {"BTCUSDT": 50000.0, "ETHUSDT": 3000.0, "SOLUSDT": 100.0,
-                   "BNBUSDT": 300.0, "XRPUSDT": 0.50}
+    base_prices = {"BTCUSDT": 50000.0, "ETHUSDT": 3000.0, "SOLUSDT": 100.0}
     events = []
     for i in range(ticks):
         for raw in symbols:
@@ -28,23 +27,29 @@ def _generate_replay_feed(symbols: list[str], ticks: int):
             bid = price * 0.9995
             ask = price * 1.0005
             vol = base * 10000 + abs(trend) * 100
-            # Multi-level order book depths (not just 1 unit!)
-            bid_depths = [
-                (bid - step * price * 0.0001, 20.0 / (step + 1))
-                for step in range(20)
-            ]
-            ask_depths = [
-                (ask + step * price * 0.0001, 20.0 / (step + 1))
-                for step in range(20)
-            ]
-            events.append({
-                "type": "ticker", "symbol": raw, "bid": bid, "ask": ask,
-                "last": price, "volume_24h": vol,
-            })
-            events.append({
-                "type": "book", "symbol": raw, "bids": bid_depths, "asks": ask_depths,
-            })
+            bid_depths = [(bid - s * price * 0.0001, 20.0 / (s + 1)) for s in range(20)]
+            ask_depths = [(ask + s * price * 0.0001, 20.0 / (s + 1)) for s in range(20)]
+            events.append({"type": "ticker", "symbol": raw, "bid": bid, "ask": ask,
+                           "last": price, "volume_24h": vol})
+            events.append({"type": "book", "symbol": raw, "bids": bid_depths, "asks": ask_depths})
     return events
+
+
+async def _background_feed(orch, symbols: list[str], duration: int, stop_event: asyncio.Event):
+    """Feed replay events through public ingestion while orchestrator.start() runs."""
+    feed = _generate_replay_feed(symbols, max(200, duration // 2))
+    feed_idx = 0
+    t0 = time_module.monotonic()
+    while time_module.monotonic() - t0 < duration and not stop_event.is_set():
+        batch_end = min(feed_idx + 10, len(feed))
+        for evt in feed[feed_idx:batch_end]:
+            if evt["type"] == "ticker":
+                orch.process_ticker(evt["symbol"], evt["bid"], evt["ask"],
+                                    evt["last"], evt["volume_24h"])
+            elif evt["type"] == "book":
+                orch.process_order_book(evt["symbol"], evt["bids"], evt["asks"])
+        feed_idx = batch_end if batch_end < len(feed) else 0
+        await asyncio.sleep(0.05)
 
 
 async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: str = "replay"):
@@ -55,85 +60,54 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
     os.environ["PAPER_EXPERIMENT_ID"] = experiment_id
 
     db_path = f"data/soak_{experiment_id}.db"
-    orch = PaperTradingOrchestrator(symbols=symbols, initial_balance=10000, max_symbols=len(symbols), db_path=db_path)
+    orch = PaperTradingOrchestrator(
+        symbols=symbols, initial_balance=10000, max_symbols=len(symbols), db_path=db_path
+    )
 
+    wall_start = datetime.now(UTC)
     if mode == "replay":
-        # Initialize persistence + startup manually for feed injection
-        orch._persist = __import__("src.db.persist", fromlist=["PaperPersistence"]).PaperPersistence(db_path)
-        orch._persist.connect()
-        orch._persist._ensure_lease_table()
-
-        import uuid as _uuid_module
-
-        from src.paper.orchestrator import _RuntimeLease
-
-        owner_id = f"{experiment_id}-{_uuid_module.uuid4().hex[:8]}"
-        orch._lease = _RuntimeLease(orch._persist, "paper-account-1", owner_id)
-        orch._lease.try_acquire()
-        orch._persist.start_session(experiment_id, orch._get_commit_sha())
-
-        from src.strategies.breakout_strategy import BreakoutStrategy
-        from src.strategies.momentum_strategy import MomentumStrategy
-        from src.strategies.order_flow_strategy import OrderFlowStrategy
-        for s in [MomentumStrategy(), BreakoutStrategy(), OrderFlowStrategy()]:
-            orch.registry.register(s)
-        await orch.registry.initialize_all()
-        await orch.event_bus.start()
-        orch.event_bus.subscribe("ticker_events", orch._sub_ticker)
-
-        for canonical in orch._canonical_symbols:
-            a = orch.universe.register(canonical, "binance")
-            a.data_healthy = True
-
-        orch._accepting_new = True
-        orch._running = True
-
-        start_time = __import__("time").monotonic()
-        end_time = start_time + duration
-
-        feed = _generate_replay_feed(symbols, max(200, duration // 2))
-        feed_idx = 0
-
-        while orch._running and __import__("time").monotonic() < end_time:
-            # Feed events from replay fixture
-            batch_end = min(feed_idx + 10, len(feed))
-            for evt in feed[feed_idx:batch_end]:
-                if evt["type"] == "ticker":
-                    orch.process_ticker(evt["symbol"], evt["bid"], evt["ask"], evt["last"], evt["volume_24h"])
-                elif evt["type"] == "book":
-                    orch.process_order_book(evt["symbol"], evt["bids"], evt["asks"])
-            feed_idx = batch_end if batch_end < len(feed) else 0
-
-            await orch._scan_tick()
-            await asyncio.sleep(0.1)
-
-        orch._running = False
-        orch._accepting_new = False
-        await orch.event_bus.shutdown()
-        await orch.registry.shutdown_all()
-        orch._persist_final_state()
-        if orch._lease:
-            orch._lease.release()
-        orch._persist.close()
+        # Kick off orchestrator.start() and background feed in parallel
+        stop_event = asyncio.Event()
+        feed_task = asyncio.create_task(_background_feed(orch, symbols, duration, stop_event))
+        try:
+            result = await orch.start(duration_seconds=duration)
+        finally:
+            stop_event.set()
+            await feed_task
     else:
-        await orch.start(duration_seconds=duration)
-
-    result = orch._final_report()
+        result = await orch.start(duration_seconds=duration)
+    wall_end = datetime.now(UTC)
+    wall_secs = (wall_end - wall_start).total_seconds()
 
     # Write summary artifact
     artifact_dir = Path("artifacts/soak") / experiment_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    log_size = sum(
+        os.path.getsize(os.path.join("logs", f))
+        for f in os.listdir("logs") if f.startswith("engine.log")
+    ) if os.path.isdir("logs") else 0
+
+    from src.db.persist import PaperPersistence
+    p_check = PaperPersistence(db_path)
+    p_check.connect()
+    db_trade_count = p_check.count_closed_trades()
+    p_check.close()
+
     summary = {
         "experiment_id": experiment_id,
         "commit_sha": orch._get_commit_sha(),
         "mode": mode,
-        "start_time": datetime.now(UTC).isoformat(),
-        "end_time": datetime.now(UTC).isoformat(),
+        "start_time": wall_start.isoformat(),
+        "end_time": wall_end.isoformat(),
         "duration_seconds": duration,
+        "wall_seconds": wall_secs,
         "database_backend": "sqlite",
         "PASS_FAIL": "PASS",
         "metrics": {
             "runtime_seconds": result.get("duration_seconds", 0),
+            "wall_seconds": wall_secs,
             "market_events_received": result.get("publish_count", 0),
             "eventbus_publish_count": result.get("publish_count", 0),
             "eventbus_consume_count": result.get("consume_count", 0),
@@ -149,7 +123,6 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
             "positions_closed": result.get("positions_closed", 0),
             "trailing_exits": result.get("trailing_exits", 0),
             "hard_stop_exits": result.get("hard_stop_exits", 0),
-            "persistence_reads": 0,
             "persistence_writes": result.get("persistence_writes", 0),
             "persistence_errors": result.get("persistence_errors", 0),
             "lease_heartbeat_success": result.get("lease_heartbeat_success", 0),
@@ -160,22 +133,36 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
             "realized_pnl": result.get("net_pnl", 0),
             "fees": result.get("total_fees", 0),
             "slippage": result.get("total_slippage", 0),
+            "closed_trade_ram": result.get("closed_trade_ram", 0),
+            "closed_trade_ram_limit": result.get("closed_trade_ram_limit", 0),
+            "db_closed_trades": db_trade_count,
+            "rss_start_mb": result.get("rss_start_mb", 0),
+            "rss_peak_mb": result.get("rss_peak_mb", 0),
+            "rss_end_mb": result.get("rss_end_mb", 0),
+            "task_count_start": result.get("task_count_start", 0),
+            "task_count_peak": result.get("task_count_peak", 0),
+            "task_count_end": result.get("task_count_end", 0),
+            "queue_depth_peak": result.get("queue_depth_peak", 0),
+            "db_bytes_end": db_size,
+            "log_bytes_end": log_size,
         },
-        "invariants": {"negative_cash": False, "negative_quantity": False,
-                       "oversell": False, "non_finite_equity": False},
+        "invariants": {
+            "cash_non_negative": True,
+            "quantity_non_negative": True,
+            "equity_finite": True,
+        },
         "failure_reasons": [],
     }
+
     (artifact_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
     print(json.dumps({
         "experiment_id": experiment_id,
-        "duration": result.get("duration_seconds", 0),
+        "wall_seconds": wall_secs,
+        "runtime_seconds": result.get("duration_seconds", 0),
         "final_equity": result.get("final_equity", 0),
         "net_pnl": result.get("net_pnl", 0),
         "trades": result.get("total_trades", 0),
-        "wins": result.get("wins", 0),
-        "losses": result.get("losses", 0),
-        "fees": result.get("total_fees", 0),
         "publish_count": result.get("publish_count", 0),
         "consume_count": result.get("consume_count", 0),
         "signals": result.get("total_signals", 0),
@@ -185,10 +172,11 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
         "fills": result.get("fills_created", 0),
         "positions_opened": result.get("positions_opened", 0),
         "positions_closed": result.get("positions_closed", 0),
-        "mode": "PAPER",
-        "live_trading": "DISABLED",
+        "rss_start_mb": result.get("rss_start_mb", 0),
+        "rss_peak_mb": result.get("rss_peak_mb", 0),
+        "rss_end_mb": result.get("rss_end_mb", 0),
+        "mode": "PAPER", "live_trading": "DISABLED",
         "artifact": str(artifact_dir / "summary.json"),
-        "timestamp": datetime.now(UTC).isoformat(),
     }, indent=2, default=str))
 
     # Auto-fail checks
@@ -202,12 +190,24 @@ async def run_soak(duration: int, symbols: list[str], experiment_id: str, mode: 
         failures.append("NON_FINITE_EQUITY")
     if result.get("persistence_errors", 0) > 0:
         failures.append("PERSISTENCE_ERRORS")
+    # R14: Stale feed check
+    all_healthy = all(
+        f.is_healthy for f in orch.feed_health.get_all()
+    ) if orch.feed_health.get_all() else True
+    if not all_healthy and orch._accepting_new:
+        failures.append("STALE_FEED_WHILE_ACCEPTING")
 
     if failures:
         print(f"SOAK FAILED: {failures}", file=sys.stderr)
-        # Update summary
         summary["PASS_FAIL"] = "FAIL"
         summary["failure_reasons"] = failures
+        for f in failures:
+            if f == "NEGATIVE_CASH":
+                summary["invariants"]["cash_non_negative"] = False
+            elif f == "NEGATIVE_QTY":
+                summary["invariants"]["quantity_non_negative"] = False
+            elif f == "NON_FINITE_EQUITY":
+                summary["invariants"]["equity_finite"] = False
         (artifact_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         sys.exit(1)
 
@@ -223,7 +223,7 @@ async def main():
     setup_logging(level="INFO", fmt="json", log_dir="logs")
     symbols = [s.strip().upper() for s in args.symbols.split(",")]
     exp_id = args.experiment_id or f"soak-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
-    print(f"SOAK START: experiment={exp_id} duration={args.duration}s symbols={len(symbols)} mode={args.mode}")
+    print(f"SOAK START: experiment={exp_id} duration={args.duration}s mode={args.mode}")
     await run_soak(args.duration, symbols, exp_id, args.mode)
     print(f"SOAK END: experiment={exp_id}")
 
