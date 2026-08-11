@@ -101,7 +101,7 @@ async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.
 
 
 async def run_live_paper(
-    duration: int, symbols: list[str], experiment_id: str, activity_test: bool = False
+    duration: int, symbols: list[str], experiment_id: str, activity_test: bool = False, was_auto_detected: bool = True
 ):
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
@@ -113,7 +113,7 @@ async def run_live_paper(
 
     db_path = f"data/{experiment_id}.db"
     print(f"LIVE-PAPER: DB={db_path}")
-    print(f"LIVE-PAPER: Symbols={len(symbols)} (dynamic universe)")
+    print(f"LIVE-PAPER: Symbols={len(symbols)} ('specified' if not was_auto_detected else 'auto-detected')")
     print(f"LIVE-PAPER: Duration={duration}s")
     if activity_test:
         print("LIVE-PAPER: MODE = PAPER ACTIVITY TEST")
@@ -250,14 +250,14 @@ async def main():
     print("  QUANT ENGINE — DYNAMIC KUCOIN UNIVERSE")
     if args.activity_test:
         print("  *** PAPER ACTIVITY TEST MODE ***")
-    print(f"  Symbols:       {len(symbols)} (auto-detected)")
+    print(f"  Symbols:       {len(symbols)} ({'specified' if args.symbols else 'auto-detected'})")
     print(f"  Duration:      {args.duration}s")
     print(f"  Experiment:    {exp_id}")
     print("  REAL ORDERS:   DISABLED")
     print("=" * 70)
     print()
 
-    exit_code = await run_live_paper(args.duration, symbols, exp_id,
+    exit_code = await run_live_paper(args.duration, symbols, exp_id, was_auto_detected=not bool(args.symbols),
                                      activity_test=args.activity_test)
     sys.exit(exit_code)
 
