@@ -139,7 +139,8 @@ class KuCoinPublicAdapter:
             data = r.json()
             if data.get("code") != "200000":
                 return []
-            return data.get("data", [])
+            raw_data = data.get("data", [])
+            return raw_data if isinstance(raw_data, list) else []
         except Exception:
             return []
 

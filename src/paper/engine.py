@@ -143,7 +143,7 @@ class PaperExecutionEngine:
 
         status = "FILLED"
         if remaining > 0.001:
-            status = "PARTIALLY_FILLED"
+            status = "PARTIALLY_FILLED_CANCELED"
 
         return PaperFillResult(
             symbol=symbol,

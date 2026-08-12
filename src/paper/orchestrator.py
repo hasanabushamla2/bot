@@ -1,4 +1,18 @@
-"""Paper Trading Orchestrator — ROUND 14: 9-blocker evidence closure."""
+"""Paper Trading Orchestrator — Complete Multi-Stage Execution & Risk Pipeline.
+
+Implements:
+SIGNAL
+→ MARKET QUALITY
+→ LIQUIDITY GATE
+→ EXECUTION FEASIBILITY
+→ RISK (Hierarchical: Portfolio, Strategy, Symbol)
+→ POSITION SIZE (Execution-aware)
+→ ORDER
+→ FILL
+→ POSITION
+→ EXIT
+→ RECONCILIATION
+"""
 
 from __future__ import annotations
 
@@ -26,6 +40,7 @@ def _get_memory_mb() -> float:
         except Exception:
             return 0.0
 
+
 from src.analytics.tracker import AnalyticsTracker
 from src.core.logging_config import get_logger
 from src.data.event_bus import EventBus
@@ -33,6 +48,12 @@ from src.data.feed_health import FeedHealthMonitor
 from src.data.normalization import BookLevel, CanonicalSymbol, TickerEvent
 from src.data.order_book import OrderBookEngine
 from src.db.persist import PaperPersistence
+from src.execution.estimator import ExecutionEstimator
+from src.execution.liquidity_gate import (
+    LiquidityGate,
+    LiquidityGateConfig,
+    LiquidityRejectionReason,
+)
 from src.features.engine import FeatureEngine
 from src.opportunity.engine import OpportunityEngine
 from src.paper.account import CLOSED_TRADE_RAM_LIMIT, ClosedTrade, PaperAccount, PaperPosition
@@ -45,6 +66,8 @@ from src.portfolio.liquidity import LiquidityAnalyzer
 from src.portfolio.markets import AssetQualityFilter, QualityFilterConfig
 from src.portfolio.universe import UniverseConfig, UniverseManager
 from src.risk.engine import RiskEngine
+from src.risk.strategy_risk import StrategyRiskConfig, StrategyRiskManager
+from src.risk.symbol_risk import SymbolRiskConfig, SymbolRiskManager
 from src.scanner.global_scanner import AssetClass, AssetSnapshot, GlobalScanner
 from src.strategies.breakout_strategy import BreakoutStrategy
 from src.strategies.momentum_strategy import MomentumStrategy
@@ -125,7 +148,7 @@ class _RuntimeLease:
 
 
 class PaperTradingOrchestrator:
-    """Round 14: 9-blocker closure."""
+    """Multi-market, execution-aware paper trading orchestrator."""
 
     def __init__(
         self,
@@ -167,6 +190,19 @@ class PaperTradingOrchestrator:
         self.paper_exec = PaperExecutionEngine()
         self.monitor = PositionMonitor(self.account)
         self.analytics = AnalyticsTracker()
+
+        # Engineering Defect Fix Components
+        self.liquidity_gate = LiquidityGate(LiquidityGateConfig())
+        self.execution_estimator = ExecutionEstimator(
+            max_entry_slippage_bps=25.0,
+            max_exit_slippage_bps=35.0,
+            max_levels_consumed=8,
+            max_depth_participation_pct=0.10,
+            max_effective_stop_loss_pct=0.80,
+        )
+        self.symbol_risk = SymbolRiskManager(SymbolRiskConfig())
+        self.strategy_risk = StrategyRiskManager(StrategyRiskConfig())
+
         self._persist: PaperPersistence | None = None
         self._lease: _RuntimeLease | None = None
 
@@ -191,7 +227,8 @@ class PaperTradingOrchestrator:
         self._orders_created = 0
         self._fills_created = 0
         self._partial_fills = 0
-        self._positions_opened_total = 0  # R15: cumulative counter
+        self._partial_fills_canceled = 0
+        self._positions_opened_total = 0
         self._positions_closed = 0
         self._trailing_exits = 0
         self._hard_stop_exits = 0
@@ -202,6 +239,19 @@ class PaperTradingOrchestrator:
         self._persistence_errors = 0
         self._exceptions = 0
 
+        # Observability metrics
+        self._liquidity_checks = 0
+        self._liquidity_rejections = 0
+        self._spread_rejections = 0
+        self._entry_slippage_rejections = 0
+        self._exit_slippage_rejections = 0
+        self._participation_rejections = 0
+        self._stale_market_rejections = 0
+        self._reentry_rejections = 0
+        self._symbol_cooldown_rejections = 0
+        self._expected_edge_rejections = 0
+        self._slippage_bps_list: list[float] = []
+
         self._rss_start_mb: float = 0.0
         self._rss_peak_mb: float = 0.0
         self._task_count_start: int = 0
@@ -211,14 +261,14 @@ class PaperTradingOrchestrator:
         self._trade_log: deque[dict[str, Any]] = deque(maxlen=50000)
         self._error_log: deque[dict[str, Any]] = deque(maxlen=1000)
 
-        # R14: closed-trade dedup set to prevent re-persistence
+        # Closed-trade dedup set
         self._persisted_trade_ids: set[str] = set()
 
-        # R16: runtime safety flags for soak auto-fail detection
+        # Runtime safety flags
         self._fatal_error: str | None = None
         self._stale_feed_violation: bool = False
 
-        # R21: Strategy pipeline observability counters
+        # Strategy observability counters
         self._strategy_evaluations: int = 0
         self._strategy_evaluations_by_strategy: dict[str, int] = {}
         self._strategy_evaluations_by_symbol: dict[str, int] = {}
@@ -324,6 +374,10 @@ class PaperTradingOrchestrator:
     def _restore_state(self) -> None:
         if self._persist is None:
             return
+
+        # Clean up any orphaned trail records on startup
+        self._persist.cleanup_orphan_trails()
+
         saved = self._persist.load_account()
         if saved is not None:
             s = self.account.state
@@ -337,7 +391,7 @@ class PaperTradingOrchestrator:
             s.loss_count = saved.get("loss_count", 0)
             s.peak_equity = saved.get("peak_equity", self.initial_balance)
 
-        # R15: Restore closed trades with original timestamps and trade_id from DB
+        # Restore closed trades
         db_trades = self._persist.load_recent_closed_trades(200)
         for t_dict in db_trades:
             entry_time = _parse_iso_or_now(t_dict.get("entry_time", ""))
@@ -408,13 +462,11 @@ class PaperTradingOrchestrator:
             unhealthy = self.feed_health.check_all()
             all_feeds = self.feed_health.get_all()
             if all_feeds and all(not f.is_healthy for f in all_feeds):
-                # R16: Record stale-feed violation WHILE still accepting new
                 if self._accepting_new:
                     self._stale_feed_violation = True
                 self._accepting_new = False
                 self._health_recovery_counter.clear()
             elif unhealthy:
-                # R26: Only ticker staleness is a violation. Books are batched.
                 ticker_unhealthy = [fh for fh in unhealthy if fh.stream_type == "ticker" and fh.messages_received > 0]
                 if ticker_unhealthy:
                     if self._accepting_new:
@@ -440,7 +492,7 @@ class PaperTradingOrchestrator:
 
     # ══════════════════════════════════════════════════════════════════
     def _reconcile_risk(self) -> None:
-        """R14 P-01: Reconcile risk state from current account positions immediately."""
+        """Reconcile risk state from current account positions immediately."""
         exp = self.account.state.allocated
         strat_counts: dict[str, int] = {}
         per_strat: dict[str, float] = {}
@@ -553,10 +605,8 @@ class PaperTradingOrchestrator:
             self._persistence_errors += 1
 
     def _persist_closed_trade(self, trade: ClosedTrade) -> None:
-        """R15 P-02: Use existing durable trade_id or generate deterministic one."""
         if self._persist is None:
             return
-        # Use existing durable trade_id if set (restored trades)
         if trade.trade_id:
             trade_id = trade.trade_id
         else:
@@ -564,7 +614,7 @@ class PaperTradingOrchestrator:
                 f"ct-{trade.symbol}-{trade.exit_time.strftime('%Y%m%d%H%M%S%f')[:16]}"
                 f"-{trade.entry_price:.2f}-{trade.exit_price:.2f}-{trade.quantity:.6f}"
             )
-            trade.trade_id = trade_id  # Store for future reference
+            trade.trade_id = trade_id
         if trade_id in self._persisted_trade_ids:
             return
         if self._persist.closed_trade_exists(trade_id):
@@ -596,9 +646,9 @@ class PaperTradingOrchestrator:
                 self._persist_position(pid, pos)
                 self._persist_trail(pid)
             self._reconcile_risk()
-            # R14 P-02: Only persist trades not already persisted
             for trade in self.account.state.closed_trades:
                 self._persist_closed_trade(trade)
+            self._persist.cleanup_orphan_trails()
             self._persist.audit("GRACEFUL_SHUTDOWN", "Clean stop")
             self._persist.end_session(self._get_experiment_id(), "COMPLETED")
         except Exception:
@@ -660,7 +710,7 @@ class PaperTradingOrchestrator:
         if not self._accepting_new:
             return
 
-        # 1. Check stops/trails
+        # ── 1. CHECK STOPS / TRAILING EXITS (REALISTIC DEPTH WALK) ──
         exits = self.monitor.check_all()
         for ex in exits:
             sym = ex["symbol"]
@@ -669,7 +719,7 @@ class PaperTradingOrchestrator:
                 continue
             qty = pos_data.quantity
             book = self.order_book_engine.get_book("binance", sym)
-            bids_depth = [(lv[0], lv[1]) for lv in (book.bids.levels[:20] if book else [])] if book else None
+            bids_depth = [(lv[0], lv[1]) for lv in (book.bids.levels if book else [])] if book else None
             bid = book.best_bid if book and book.best_bid > 0 else self._get_bid(sym)
 
             order_id = f"exit-{sym}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -680,7 +730,6 @@ class PaperTradingOrchestrator:
             if fill is None or fill.filled_qty <= 0:
                 continue
 
-            # R14 D-01: requested_qty = qty (immutable, captured before await)
             self._persist_order({
                 "order_id": order_id, "client_order_id": order_id,
                 "symbol": sym, "side": "sell", "requested_qty": qty,
@@ -695,8 +744,10 @@ class PaperTradingOrchestrator:
                 "fees": fill.fees, "slippage_bps": fill.slippage_bps,
             })
             self._fills_created += 1
-            if fill.status == "PARTIALLY_FILLED":
+            if fill.status == "PARTIALLY_FILLED_CANCELED":
+                self._partial_fills_canceled += 1
                 self._partial_fills += 1
+            self._slippage_bps_list.append(fill.slippage_bps)
 
             if abs(fill.filled_qty - qty) < 0.00000001:
                 trade = self.account.close_position(
@@ -708,7 +759,7 @@ class PaperTradingOrchestrator:
                 self._positions_closed += 1
                 if ex["reason"] == "trail_hit":
                     self._trailing_exits += 1
-                elif ex["reason"] == "hard_stop":
+                elif ex["reason"] in ("hard_stop", "stop_loss"):
                     self._hard_stop_exits += 1
             else:
                 trade = self.account.reduce_position(
@@ -731,134 +782,142 @@ class PaperTradingOrchestrator:
                                         "time": datetime.now(UTC).isoformat()})
                 self._persist_account()
                 self._persist_closed_trade(trade)
+
+                # Record exit in Symbol & Strategy Risk Managers
+                self.symbol_risk.record_trade_exit(
+                    sym, trade.net_pnl, ex["reason"], fill.slippage_bps, self.account.state.equity
+                )
+                self.strategy_risk.record_trade_exit(
+                    trade.strategy_id, trade.gross_pnl, trade.net_pnl, trade.fees,
+                    trade.slippage_cost, ex["reason"], self.account.state.equity
+                )
+
                 pid = f"pos-{sym}"
                 if self._persist is not None:
                     if sym in self.account.state.open_positions:
                         self._persist_position(pid, self.account.state.open_positions[sym])
                     else:
                         self._persist.delete_position(pid)
-                # R14 P-01: reconcile risk immediately after exit
+                        self._persist.delete_trail(pid)
                 self._reconcile_risk()
 
-        # 2. Build snapshots
+        # ── 2. GLOBAL RISK / CIRCUIT BREAKER CHECK ──
+        if self.risk_engine.state.circuit_breaker_tripped or self.risk_engine.state.kill_switch_active:
+            logger.warning("risk_circuit_breaker_active_entries_blocked")
+            return
+
+        # ── 3. MARKET SCREENING & LIQUIDITY GATE ──
         snapshots: list[AssetSnapshot] = []
         for canonical in self._canonical_symbols:
             feat = self.features.get(canonical)
-            if feat.sample_count < 10:
+            if feat.sample_count < 10 or feat.last_price <= 0:
                 continue
+
+            # Check Feed Health
             ticker_health = self.feed_health.get("binance", canonical, "ticker")
-            book_health = self.feed_health.get("binance", canonical, "book")
             if ticker_health and not ticker_health.is_healthy:
                 continue
-            if book_health and not book_health.is_healthy:
-                continue
-            asset = self.universe.get(canonical, "binance")
-            if asset and asset.status.value not in ("active", "watch"):
-                continue
-            book = self.order_book_engine.get_book("binance", canonical)
-            liq = self.liquidity.analyze(None, feat.volume_24h)
-            if book:
-                liq.bid = book.best_bid
-                liq.ask = book.best_ask
-                liq.spread_pct = book.spread_bps / 100.0 if book.spread_bps > 0 else 0.05
-                liq.depth_10bps = book.depth_within_bps(10)
-                liq.liquidity_score = 0.85
-            qr = self.quality_filter.assess(
-                canonical, "binance", liquidity=liq, volume_24h=feat.volume_24h,
-                spread_pct=liq.spread_pct,
-                data_age_seconds=max(0.0, (datetime.now(UTC) - feat.updated_at).total_seconds()),
-                daily_trades=5000,
+
+            # Check Symbol Risk & Cooldowns
+            is_eligible, reason_str = self.symbol_risk.is_symbol_eligible(
+                canonical, self.account.state.equity
             )
-            if not qr.qualified:
-                self.analytics.record_opportunity(rejected=True)
+            if not is_eligible:
+                self._symbol_cooldown_rejections += 1
+                if "REENTRY" in reason_str:
+                    self._reentry_rejections += 1
                 continue
+
+            # Data Age
+            data_age = max(0.0, (datetime.now(UTC) - feat.updated_at).total_seconds())
+
+            # Evaluate Liquidity Gate
+            book = self.order_book_engine.get_book("binance", canonical)
+            self._liquidity_checks += 1
+            lq_eval = self.liquidity_gate.assess_market(
+                canonical, book, feat.volume_24h, data_age,
+                expected_slippage_bps=feat.spread_bps / 2.0,
+            )
+            if not lq_eval.passed:
+                self._liquidity_rejections += 1
+                if lq_eval.reason == LiquidityRejectionReason.SPREAD_TOO_WIDE:
+                    self._spread_rejections += 1
+                elif lq_eval.reason == LiquidityRejectionReason.MARKET_DATA_STALE:
+                    self._stale_market_rejections += 1
+                continue
+
+            # Build qualified AssetSnapshot
+            depth_10bps = book.depth_within_bps(10) if book else 0.0
             snapshots.append(AssetSnapshot(
                 symbol=canonical, exchange="binance", asset_class=AssetClass.CRYPTO_SPOT,
                 last_price=feat.last_price, bid=feat.bid, ask=feat.ask,
-                spread_pct=liq.spread_pct, volume_24h=feat.volume_24h,
+                spread_pct=lq_eval.spread_bps / 100.0, volume_24h=feat.volume_24h,
                 price_change_1m_pct=feat.return_1m_pct,
                 price_change_5m_pct=feat.return_5m_pct,
                 volume_vs_avg_ratio=max(1.0, feat.relative_volume),
-                bid_ask_ratio=feat.bid_ask_ratio, depth_bid_10bps=liq.depth_10bps,
+                bid_ask_ratio=feat.bid_ask_ratio, depth_bid_10bps=depth_10bps,
             ))
-        self.analytics.record_opportunity()
-        if not snapshots:
-            return
 
-        # 3. Signals
-        scanner_signals = self.scanner.scan(snapshots)
-        strategy_signals = self.scanner.to_strategy_signals(scanner_signals)
-        for canonical in self._canonical_symbols:
-            feat = self.features.get(canonical)
-            if feat.sample_count < 10:
-                continue
-            for strat in self.registry.get_enabled():
-                self._strategy_evaluations += 1
-                sid = strat.strategy_id
-                self._strategy_evaluations_by_strategy[sid] = \
-                    self._strategy_evaluations_by_strategy.get(sid, 0) + 1
-                self._strategy_evaluations_by_symbol[canonical] = \
-                    self._strategy_evaluations_by_symbol.get(canonical, 0) + 1
-                try:
-                    sig = await strat.analyze(features=feat)  # type: ignore[call-arg]
-                    if sig and not sig.is_expired:
-                        strategy_signals.append(sig)
-                    else:
-                        self._no_signal_decisions += 1
-                        # Determine the rejection reason
-                        if feat.sample_count < 20:
-                            reason = "insufficient_history"
-                        elif sid == "momentum_v1":
-                            if feat.momentum_5m <= 0 and feat.trend_strength <= 0:
-                                reason = "no_momentum"
-                            elif feat.trend_strength <= 0:
-                                reason = "no_trend"
-                            else:
-                                reason = "threshold_not_met"
-                        elif sid == "breakout_v1":
-                            if feat.relative_volume < 2.0:
-                                reason = "low_volume"
-                            elif feat.breakout_position_pct < 80:
-                                reason = "no_breakout"
-                            else:
-                                reason = "threshold_not_met"
-                        elif sid == "order_flow_v1":
-                            if feat.bid_ask_ratio < 1.2:
-                                reason = "balanced_book"
-                            elif feat.trade_flow_ratio < 1.5:
-                                reason = "neutral_flow"
-                            else:
-                                reason = "threshold_not_met"
+        # ── 4. STRATEGY SIGNALS GENERATION ──
+        strategy_signals = []
+        if snapshots:
+            scanner_signals = self.scanner.scan(snapshots)
+            strategy_signals.extend(self.scanner.to_strategy_signals(scanner_signals))
+            for snap in snapshots:
+                canonical = snap.symbol
+                feat = self.features.get(canonical)
+                for strat in self.registry.get_enabled():
+                    sid = strat.strategy_id
+                    # Check Strategy Risk / Cooldown
+                    is_strat_eligible, _ = self.strategy_risk.is_strategy_eligible(
+                        sid, self.account.state.equity
+                    )
+                    if not is_strat_eligible:
+                        continue
+
+                    self._strategy_evaluations += 1
+                    self._strategy_evaluations_by_strategy[sid] = (
+                        self._strategy_evaluations_by_strategy.get(sid, 0) + 1
+                    )
+                    self._strategy_evaluations_by_symbol[canonical] = (
+                        self._strategy_evaluations_by_symbol.get(canonical, 0) + 1
+                    )
+                    try:
+                        sig = await strat.analyze(features=feat)  # type: ignore[call-arg]
+                        if sig and not sig.is_expired:
+                            # Cost-Aware Expectancy Check
+                            taker_fee = 0.001
+                            est_spread = max(0.0005, (feat.ask - feat.bid) / max(0.01, feat.last_price))
+                            est_slippage = 0.0005
+                            round_trip_cost = (taker_fee * 2) + est_spread + (est_slippage * 2)
+                            min_edge = round_trip_cost + 0.001  # Need at least cost + 10 bps
+                            if (sig.estimated_return or 0.0) < min_edge:
+                                self._expected_edge_rejections += 1
+                                continue
+                            strategy_signals.append(sig)
                         else:
-                            reason = "unknown"
-                        self._no_signal_reasons[reason] = \
-                            self._no_signal_reasons.get(reason, 0) + 1
-                except Exception:
-                    self._exceptions += 1
+                            self._no_signal_decisions += 1
+                    except Exception:
+                        self._exceptions += 1
+
         self._total_signals += len(strategy_signals)
 
-        # R22: Activity test mode — inject controlled paper signals using real prices
+        # Activity test mode
         if self._activity_test and not strategy_signals:
             test_sigs = self._inject_test_signals()
             strategy_signals.extend(test_sigs)
             self._total_signals += len(test_sigs)
-            if test_sigs:
-                logger.info(
-                    "activity_test_signals",
-                    count=len(test_sigs),
-                    symbols=[s.symbol for s in test_sigs],
-                )
 
         if not strategy_signals:
             return
 
-        # 4. Opportunity
+        # ── 5. OPPORTUNITY EVALUATION & RANKING ──
         opportunities = self.opportunity_engine.evaluate_batch(strategy_signals)
         self._total_opportunities += len(opportunities)
         if not opportunities:
             return
 
-        # 5. Risk update from state
+        # ── 6. RISK & PORTFOLIO CAPACITY ALLOCATION ──
         self.risk_engine.update_state(
             total_exposure=self.account.state.allocated,
             current_equity=self.account.state.equity,
@@ -877,6 +936,26 @@ class PaperTradingOrchestrator:
 
         for opp in opportunities[:available]:
             sym = opp.signal.symbol or "unknown"
+            if sym in self.account.state.open_positions:
+                continue
+
+            # Check Symbol Risk & Cooldown before entry
+            is_symbol_eligible, reason_str = self.symbol_risk.is_symbol_eligible(
+                sym, self.account.state.equity
+            )
+            if not is_symbol_eligible:
+                self._symbol_cooldown_rejections += 1
+                if "REENTRY" in reason_str:
+                    self._reentry_rejections += 1
+                continue
+
+            # Check Strategy Risk & Cooldown before entry
+            is_strat_eligible, _ = self.strategy_risk.is_strategy_eligible(
+                opp.signal.strategy_id, self.account.state.equity
+            )
+            if not is_strat_eligible:
+                continue
+
             self._risk_assessments += 1
             risk = self.risk_engine.assess(opp)
             if risk.decision.value != "approved":
@@ -885,10 +964,13 @@ class PaperTradingOrchestrator:
             self._risk_approved += 1
             if risk.stop_loss_price is None:
                 continue
-            if sym in self.account.state.open_positions:
-                continue
 
             feat = self.features.get(sym)
+            book = self.order_book_engine.get_book("binance", sym)
+            if not book or not book.asks.levels or not book.bids.levels:
+                continue
+
+            # Capital Sizing
             cap = PositionCapacity(
                 symbol=sym, strategy_id=opp.signal.strategy_id,
                 max_efficient_size=min(risk.max_position_size, self.account.state.cash * 0.2),
@@ -897,18 +979,48 @@ class PaperTradingOrchestrator:
             decisions = self.allocator.allocate(pf_state, [(opp, risk, cap)])
             if not decisions or not decisions[0].is_allocated:
                 continue
-            pos_size = decisions[0].allocated_capital
-            if pos_size < 50:
+
+            allocated_capital = decisions[0].allocated_capital
+            if allocated_capital < 50.0:
                 continue
 
-            book = self.order_book_engine.get_book("binance", sym)
-            asks_depth = ([(lv[0], lv[1]) for lv in book.asks.levels[:20]] if book and book.asks else None)
+            # ── 7. EXECUTION-AWARE POSITION SIZING & PRE-TRADE SIMULATION ──
+            capital_qty = allocated_capital / max(feat.ask, 0.01)
+            risk_qty = risk.max_position_size / max(feat.ask, 0.01)
 
-            # R14 D-01: Capture requested_qty from immutable values BEFORE await
-            requested_qty = pos_size / max(feat.ask, 0.01)
+            safe_qty = self.execution_estimator.compute_max_safe_quantity(
+                sym, book, risk_qty=risk_qty, capital_qty=capital_qty,
+                strategy_qty=capital_qty, stop_loss_pct=0.30,
+            )
+            if safe_qty * feat.ask < 50.0:
+                self._participation_rejections += 1
+                self._liquidity_rejections += 1
+                continue
 
+            # Pre-trade BUY entry simulation
+            entry_sim = self.execution_estimator.simulate_buy_entry(sym, book, safe_qty)
+            if not entry_sim.passed:
+                self._liquidity_rejections += 1
+                if entry_sim.rejection_reason == LiquidityRejectionReason.ENTRY_SLIPPAGE_TOO_HIGH:
+                    self._entry_slippage_rejections += 1
+                elif entry_sim.rejection_reason == LiquidityRejectionReason.PARTICIPATION_TOO_HIGH:
+                    self._participation_rejections += 1
+                continue
+
+            # Pre-trade SELL exit simulation (Emergency liquidation depth check)
+            exit_sim = self.execution_estimator.simulate_sell_exit(
+                sym, book, entry_sim.filled_qty, stop_loss_pct=0.30
+            )
+            if not exit_sim.passed:
+                self._liquidity_rejections += 1
+                if exit_sim.rejection_reason == LiquidityRejectionReason.EXIT_SLIPPAGE_TOO_HIGH:
+                    self._exit_slippage_rejections += 1
+                continue
+
+            # ── 8. ORDER CREATION & EXECUTION ──
+            asks_depth = [(lv[0], lv[1]) for lv in book.asks.levels]
             entry_fill = await self.paper_exec.simulate_fill(
-                sym, "buy", requested_qty,
+                sym, "buy", safe_qty,
                 bid=feat.bid, ask=feat.ask, last=feat.last_price,
                 asks_depth=asks_depth,
             )
@@ -916,13 +1028,12 @@ class PaperTradingOrchestrator:
                 continue
 
             order_id = f"entry-{sym}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
-            # R14 D-01: Use captured requested_qty, not recomputed from feat
             self._persist_order({
                 "order_id": order_id, "client_order_id": order_id,
                 "symbol": sym, "side": "buy",
-                "requested_qty": requested_qty,
+                "requested_qty": safe_qty,
                 "filled_qty": entry_fill.filled_qty,
-                "remaining_qty": max(requested_qty - entry_fill.filled_qty, 0),
+                "remaining_qty": max(safe_qty - entry_fill.filled_qty, 0),
                 "avg_fill_price": entry_fill.fill_price,
                 "status": entry_fill.status,
             })
@@ -936,14 +1047,16 @@ class PaperTradingOrchestrator:
                 "fees": entry_fill.fees, "slippage_bps": entry_fill.slippage_bps,
             })
             self._fills_created += 1
-            if entry_fill.status == "PARTIALLY_FILLED":
+            if entry_fill.status == "PARTIALLY_FILLED_CANCELED":
+                self._partial_fills_canceled += 1
                 self._partial_fills += 1
+            self._slippage_bps_list.append(entry_fill.slippage_bps)
 
             quantity = entry_fill.filled_qty
             fill_price = entry_fill.fill_price
 
-            # R14 S-01: Anchor hard stop to ACTUAL entry fill
-            hard_stop = fill_price * (1.0 - 0.003)  # exactly -0.30%
+            # Hard stop anchored to actual entry fill
+            hard_stop = fill_price * (1.0 - 0.003)
 
             pos = self.account.open_position(
                 sym, "long", fill_price, quantity,
@@ -953,7 +1066,7 @@ class PaperTradingOrchestrator:
             if pos:
                 pos_id = f"pos-{sym}"
                 self.monitor.register_position(pos)
-                self._positions_opened_total += 1  # R15: cumulative
+                self._positions_opened_total += 1
                 self._total_trades += 1
                 self.analytics.record_allocation(
                     sym, opp.signal.strategy_id, "binance",
@@ -965,54 +1078,45 @@ class PaperTradingOrchestrator:
                     "time": datetime.now(UTC).isoformat(),
                 })
                 self._persist_position(pos_id, pos)
+                self._persist_trail(pos_id)
                 self._persist_account()
-                # R14 P-01: reconcile risk immediately after entry
                 self._reconcile_risk()
-        self._total_scans += 1
 
-        # R21: Per-scan diagnostic
-        logger.info(
-            "strategy_diagnostic",
-            scan=self._total_scans,
-            evaluations=self._strategy_evaluations,
-            by_strategy=self._strategy_evaluations_by_strategy.copy(),
-            signals=self._total_signals,
-            no_signal=self._no_signal_decisions,
-            no_signal_reasons=self._no_signal_reasons.copy(),
-            market_events=self._market_events_received,
-            ticker=self._ticker_events_received,
-            book=self._book_events_received,
-        )
+        self._total_scans += 1
 
         # Persist trail state at runtime
         for sym in list(self.account.state.open_positions.keys()):
             self._persist_trail(f"pos-{sym}")
 
-    # R22: Activity test signal injector — uses real current prices
+    # ══════════════════════════════════════════════════════════════════
     def _inject_test_signals(self) -> list:
-        """Generate controlled paper signals for pipeline verification.
-
-        Creates one BUY signal per eligible symbol using CURRENT real prices.
-        Only fires every ~60s to avoid flooding. NEVER touches real exchange.
-        """
         now = time.monotonic()
-        if now - self._last_test_signal_time < 60.0:
+        if self._last_test_signal_time > 0 and (now - self._last_test_signal_time < 30.0):
             return []
-        self._last_test_signal_time = now
 
         from datetime import timedelta
-
         from src.strategies.base import SignalDirection, StrategySignal
 
         signals = []
-        eligible = [
-            s for s in self._canonical_symbols
-            if s not in self.account.state.open_positions
-            and self.features.get(s).last_price > 0
-        ]
+        eligible = []
+        for s in self._canonical_symbols:
+            if s in self.account.state.open_positions:
+                continue
+            is_eligible, _ = self.symbol_risk.is_symbol_eligible(s, self.account.state.equity)
+            if not is_eligible:
+                continue
+            feat = self.features.get(s)
+            if feat.last_price <= 0 or feat.ask <= 0:
+                continue
+            bk = self.order_book_engine.get_book("binance", s)
+            if bk is not None and bool(bk.bids.levels) and bool(bk.asks.levels):
+                lq = self.liquidity_gate.assess_market(s, bk, feat.volume_24h, 1.0)
+                if lq.passed:
+                    eligible.append(s)
         if not eligible:
             return []
 
+        self._last_test_signal_time = now
         sym = eligible[0]
         feat = self.features.get(sym)
         price = feat.last_price
@@ -1024,6 +1128,7 @@ class PaperTradingOrchestrator:
             confidence=0.99,
             estimated_return=0.01,
             estimated_risk=0.3,
+            required_capital=500.0,
             timestamp=datetime.now(UTC),
             signal_expires_at=datetime.now(UTC) + timedelta(seconds=120),
             entry_logic={"type": "activity_test", "price": price},
@@ -1040,7 +1145,6 @@ class PaperTradingOrchestrator:
             },
         )
         signals.append(sig)
-        logger.info("activity_test_signal_created", symbol=sym, price=round(price, 2))
         return signals
 
     async def _scan_loop(self) -> None:
@@ -1054,7 +1158,6 @@ class PaperTradingOrchestrator:
                 self._exceptions += 1
                 logger.exception("scan_loop_error")
                 self._error_log.append({"error": "scan_loop", "time": datetime.now(UTC).isoformat()})
-                # R16: Record the first fatal error and stop
                 if self._fatal_error is None:
                     self._fatal_error = f"fatal_scan_loop_exception_at_{datetime.now(UTC).isoformat()}"
                 self._running = False
@@ -1067,9 +1170,11 @@ class PaperTradingOrchestrator:
             self._touch_heartbeat()
             self._sample_resource_peak()
             s = self.account.state
-            logger.info("paper_status", equity=round(s.equity, 0), pnl=round(s.realized_pnl, 0),
-                        positions=len(s.open_positions), trades=s.trade_count,
-                        pub=self.publish_count, con=self.consume_count)
+            logger.info(
+                "paper_status", equity=round(s.equity, 0), pnl=round(s.realized_pnl, 0),
+                positions=len(s.open_positions), trades=s.trade_count,
+                pub=self.publish_count, con=self.consume_count,
+            )
 
     def _touch_heartbeat(self) -> None:
         try:
@@ -1086,6 +1191,13 @@ class PaperTradingOrchestrator:
         s = self.account.state
         wall_secs = (datetime.now(UTC) - self._wall_start).total_seconds() if self._wall_start else 0
         rss_now = _get_memory_mb()
+
+        # Compute slippage percentiles
+        slips = self._slippage_bps_list
+        avg_slip = (sum(slips) / len(slips)) if slips else 0.0
+        max_slip = max(slips) if slips else 0.0
+        p95_slip = sorted(slips)[int(len(slips) * 0.95)] if slips else 0.0
+
         return {
             "status": "complete",
             "duration_seconds": time.monotonic() - self._start_time,
@@ -1097,6 +1209,7 @@ class PaperTradingOrchestrator:
             "total_slippage": round(s.total_slippage, 4),
             "total_trades": s.trade_count,
             "wins": s.win_count, "losses": s.loss_count,
+            "win_rate": round(s.win_count / s.trade_count * 100.0, 2) if s.trade_count > 0 else 0.0,
             "total_signals": self._total_signals,
             "total_opportunities": self._total_opportunities,
             "risk_assessments": self._risk_assessments,
@@ -1105,11 +1218,25 @@ class PaperTradingOrchestrator:
             "orders_created": self._orders_created,
             "fills_created": self._fills_created,
             "partial_fills": self._partial_fills,
+            "partial_fills_canceled": self._partial_fills_canceled,
             "positions_opened": self._positions_opened_total,
             "positions_closed": self._positions_closed,
             "positions_currently_open": len(s.open_positions),
             "trailing_exits": self._trailing_exits,
             "hard_stop_exits": self._hard_stop_exits,
+            "liquidity_checks": self._liquidity_checks,
+            "liquidity_rejections": self._liquidity_rejections,
+            "spread_rejections": self._spread_rejections,
+            "entry_slippage_rejections": self._entry_slippage_rejections,
+            "exit_slippage_rejections": self._exit_slippage_rejections,
+            "participation_rejections": self._participation_rejections,
+            "stale_market_rejections": self._stale_market_rejections,
+            "reentry_rejections": self._reentry_rejections,
+            "symbol_cooldown_rejections": self._symbol_cooldown_rejections,
+            "expected_edge_rejections": self._expected_edge_rejections,
+            "average_slippage_bps": round(avg_slip, 2),
+            "p95_slippage_bps": round(p95_slip, 2),
+            "max_slippage_bps": round(max_slip, 2),
             "publish_count": self.publish_count,
             "consume_count": self.consume_count,
             "persistence_writes": self._persistence_writes,
@@ -1126,6 +1253,7 @@ class PaperTradingOrchestrator:
             "task_count_peak": self._task_count_peak,
             "task_count_end": len(asyncio.all_tasks()),
             "queue_depth_peak": self._queue_depth_peak,
+            "strategy_metrics": self.strategy_risk.get_summary(),
             "mode": "PAPER", "live_trading": "DISABLED",
         }
 

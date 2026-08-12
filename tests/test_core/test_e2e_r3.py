@@ -131,7 +131,7 @@ class TestPartialFills:
 
         random.seed(0)
         r = await exec_eng.simulate_fill("BTC/USDT", "buy", 0.1, bid=49990, ask=50010)
-        assert r.status in ("FILLED", "PARTIALLY_FILLED")
+        assert r.status in ("FILLED", "PARTIALLY_FILLED", "PARTIALLY_FILLED_CANCELED")
         assert r.filled_qty > 0
         assert r.fees > 0
 

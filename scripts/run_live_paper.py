@@ -39,13 +39,10 @@ async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.
     """Batch-poll ALL symbols via KuCoin allTickers + per-symbol order books.
 
     Uses KuCoin's /api/v1/market/allTickers for efficient mass polling
-    (~1 request for all prices), then fetches order books only for symbols
-    actively being traded/scanned by the orchestrator.
+    (~1 request for all prices), then fetches order books in batches.
     """
-    # Use allTickers for mass price data (one API call for all symbols)
-    # Fall back to per-symbol polling for order books on priority symbols only
-    batch_size = 15  # symbols per book-fetch cycle
-    book_interval = 10.0  # seconds between book-fetch cycles
+    batch_size = 25  # symbols per book-fetch cycle
+    book_interval = 3.0  # seconds between book-fetch cycles
 
     sym_list = list(symbols)
     book_idx = 0
@@ -78,7 +75,7 @@ async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.
                     s["last_price"] = t["last"]
                     s["last_ticker_ts"] = datetime.now(UTC)
 
-        # 2. Fetch order books in batches (only priority N per cycle)
+        # 2. Fetch order books in batches
         if now_ts - last_book_fetch >= book_interval:
             batch = sym_list[book_idx:book_idx + batch_size]
             for raw in batch:
@@ -191,6 +188,12 @@ async def run_live_paper(
     print()
     print("  REAL ORDERS: 0 | LIVE TRADING: DISABLED")
     print("=" * 70)
+
+    # Run Database Analysis
+    from scripts.analyze_paper_run import analyze_database, print_report
+    if Path(db_path).exists():
+        audit_res = analyze_database(db_path)
+        print_report(audit_res)
 
     failures = []
     if orch._stale_feed_violation:

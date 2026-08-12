@@ -116,7 +116,27 @@ class PaperPersistence:
 
     def delete_position(self, pid: str) -> None:
         with self._tx() as c:
+            c.execute("DELETE FROM paper_trail WHERE position_id=?", (pid,))
             c.execute("DELETE FROM paper_positions WHERE position_id=?", (pid,))
+
+    def delete_trail(self, pid: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM paper_trail WHERE position_id=?", (pid,))
+
+    def cleanup_orphan_trails(self) -> int:
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM paper_trail WHERE position_id NOT IN (SELECT position_id FROM paper_positions WHERE is_open=1)"
+            )
+            return cur.rowcount
+
+    def count_orphan_trails(self) -> int:
+        if not self._conn:
+            return 0
+        r = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM paper_trail WHERE position_id NOT IN (SELECT position_id FROM paper_positions WHERE is_open=1)"
+        ).fetchone()
+        return r["cnt"] if r else 0
 
     def load_open_positions(self) -> list[dict]:
         if not self._conn:
@@ -191,7 +211,7 @@ class PaperPersistence:
         return [
             dict(r)
             for r in self._conn.execute(
-                "SELECT * FROM paper_orders WHERE status NOT IN ('FILLED','CANCELED','REJECTED')"
+                "SELECT * FROM paper_orders WHERE status NOT IN ('FILLED','CANCELED','REJECTED','PARTIALLY_FILLED_CANCELED')"
             ).fetchall()
         ]
 
