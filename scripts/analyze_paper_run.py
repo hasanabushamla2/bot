@@ -14,6 +14,19 @@ import sys
 from pathlib import Path
 
 
+def _calc_stats(values: list[float]) -> dict:
+    if not values:
+        return {"count": 0, "avg": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    s = sorted(values)
+    return {
+        "count": len(s),
+        "avg": round(sum(s) / len(s), 2),
+        "p50": round(s[int(len(s) * 0.50)], 2),
+        "p95": round(s[int(len(s) * 0.95)], 2),
+        "max": round(max(s), 2),
+    }
+
+
 def analyze_database(db_path: str) -> dict:
     if not Path(db_path).exists():
         print(f"ERROR: Database file not found: {db_path}")
@@ -39,12 +52,11 @@ def analyze_database(db_path: str) -> dict:
         total_fees = float(acct_row["total_fees"])
         total_slippage = float(acct_row["total_slippage"])
         max_drawdown = float(acct_row["max_drawdown_pct"])
-        # ending equity = cash + sum(open positions notional)
         open_pos_rows = conn.execute("SELECT * FROM paper_positions WHERE is_open=1").fetchall()
         open_notional = sum(float(r["entry_notional"]) for r in open_pos_rows)
         ending_equity = cash + open_notional
 
-    # 2. ORDERS & FILLS & SLIPPAGE
+    # 2. ORDERS & FILLS
     orders = conn.execute("SELECT * FROM paper_orders").fetchall()
     fills = conn.execute("SELECT * FROM paper_fills").fetchall()
 
@@ -52,16 +64,33 @@ def analyze_database(db_path: str) -> dict:
     nonterminal_orders = [
         o for o in orders if str(o["status"]).upper() in ("NEW", "OPEN", "PARTIALLY_FILLED", "PENDING")
     ]
+    partially_filled_canceled = [
+        o for o in orders if str(o["status"]).upper() == "PARTIALLY_FILLED_CANCELED"
+    ]
 
-    slippage_bps_list = [float(f["slippage_bps"]) for f in fills if f["slippage_bps"] is not None]
-    if slippage_bps_list:
-        sorted_slips = sorted(slippage_bps_list)
-        avg_slip = sum(sorted_slips) / len(sorted_slips)
-        p50_slip = sorted_slips[int(len(sorted_slips) * 0.50)]
-        p95_slip = sorted_slips[int(len(sorted_slips) * 0.95)]
-        max_slip = max(sorted_slips)
-    else:
-        avg_slip = p50_slip = p95_slip = max_slip = 0.0
+    # Separated Fills by Side
+    entry_fills = [f for f in fills if str(f["side"]).lower() == "buy"]
+    exit_fills = [f for f in fills if str(f["side"]).lower() == "sell"]
+
+    entry_slips = [float(f["slippage_bps"]) for f in entry_fills if f["slippage_bps"] is not None]
+    exit_slips = [float(f["slippage_bps"]) for f in exit_fills if f["slippage_bps"] is not None]
+    all_slips = [float(f["slippage_bps"]) for f in fills if f["slippage_bps"] is not None]
+
+    entry_stats = _calc_stats(entry_slips)
+    exit_stats = _calc_stats(exit_slips)
+    all_stats = _calc_stats(all_slips)
+
+    entries_above_limit = len([s for s in entry_slips if s > 25.0])
+
+    # Find largest slippage fill
+    largest_slip_val = 0.0
+    largest_slip_sym = "NONE"
+    largest_slip_order = "NONE"
+    for f in fills:
+        if f["slippage_bps"] is not None and float(f["slippage_bps"]) > largest_slip_val:
+            largest_slip_val = float(f["slippage_bps"])
+            largest_slip_sym = f["symbol"]
+            largest_slip_order = f["order_id"]
 
     # 3. TRADING (CLOSED TRADES)
     trades = conn.execute("SELECT * FROM paper_closed_trades ORDER BY exit_time ASC").fetchall()
@@ -86,14 +115,20 @@ def analyze_database(db_path: str) -> dict:
     )
     expectancy = (net_pnl_total / trade_count) if trade_count > 0 else 0.0
 
-    # 4. EXIT REASONS
+    # 4. EXIT REASONS & CATEGORIZED SLIPPAGES
     hard_stops = [t for t in trades if t["exit_reason"] in ("hard_stop", "stop_loss")]
     trailing_exits = [t for t in trades if t["exit_reason"] == "trail_hit"]
-    other_exits = [
+    normal_exits = [
         t for t in trades if t["exit_reason"] not in ("hard_stop", "stop_loss", "trail_hit")
     ]
+
     hard_stop_pnl = sum(float(t["net_pnl"]) for t in hard_stops)
     trailing_pnl = sum(float(t["net_pnl"]) for t in trailing_exits)
+    normal_pnl = sum(float(t["net_pnl"]) for t in normal_exits)
+
+    max_effective_stop_pct = max(
+        [abs(float(t["return_pct"])) for t in hard_stops], default=0.0
+    )
 
     # 5. SYMBOLS
     sym_stats: dict[str, dict] = {}
@@ -146,22 +181,24 @@ def analyze_database(db_path: str) -> dict:
     circuit_breaker_active = bool(risk_row["breaker_active"]) if risk_row else False
 
     # 8. INTEGRITY CHECKS
-    # Orphan trails: trails with no open position
     orphan_trails = conn.execute(
         "SELECT position_id FROM paper_trail WHERE position_id NOT IN (SELECT position_id FROM paper_positions WHERE is_open=1)"
     ).fetchall()
 
-    # Duplicate trade IDs
     trade_ids = [t["trade_id"] for t in trades]
     duplicate_trade_ids = len(trade_ids) - len(set(trade_ids))
 
-    # Accounting consistency: cash == initial_equity - open_positions_cost_basis + sum(realized_pnl)
+    fill_ids = [f["fill_id"] for f in fills]
+    duplicate_fill_ids = len(fill_ids) - len(set(fill_ids))
+
     open_pos_rows = conn.execute("SELECT * FROM paper_positions WHERE is_open=1").fetchall()
-    open_cost_basis = sum(float(r["cost_basis"]) if "cost_basis" in r.keys() else float(r["entry_notional"]) + float(r.get("entry_fee", 0)) for r in open_pos_rows)
+    open_cost_basis = sum(
+        float(r["cost_basis"]) if "cost_basis" in r else float(r["entry_notional"]) + float(r["entry_fee"])
+        for r in open_pos_rows
+    )
     expected_cash = initial_equity - open_cost_basis + net_pnl_total
     accounting_mismatch = abs(cash - expected_cash) > 0.01
 
-    # Unmatched fills: fills without matching orders
     order_ids = {o["order_id"] for o in orders}
     unmatched_fills = [f for f in fills if f["order_id"] not in order_ids]
 
@@ -184,10 +221,14 @@ def analyze_database(db_path: str) -> dict:
             "fills": len(fills),
             "partial_fills": len(partial_fills),
             "nonterminal_orders": len(nonterminal_orders),
-            "average_slippage_bps": round(avg_slip, 2),
-            "p50_slippage_bps": round(p50_slip, 2),
-            "p95_slippage_bps": round(p95_slip, 2),
-            "max_slippage_bps": round(max_slip, 2),
+            "partially_filled_canceled": len(partially_filled_canceled),
+            "all_slippage": all_stats,
+            "entry_slippage": entry_stats,
+            "exit_slippage": exit_stats,
+            "entries_above_limit": entries_above_limit,
+            "largest_slippage_bps": largest_slip_val,
+            "largest_slippage_symbol": largest_slip_sym,
+            "largest_slippage_order": largest_slip_order,
         },
         "trading": {
             "trades": trade_count,
@@ -202,11 +243,19 @@ def analyze_database(db_path: str) -> dict:
             "net_pnl": round(net_pnl_total, 2),
         },
         "exit_reasons": {
-            "hard_stops": len(hard_stops),
-            "hard_stop_pnl": round(hard_stop_pnl, 2),
-            "trailing_exits": len(trailing_exits),
-            "trailing_pnl": round(trailing_pnl, 2),
-            "other_exits": len(other_exits),
+            "hard_stops": {
+                "count": len(hard_stops),
+                "pnl": round(hard_stop_pnl, 2),
+                "max_effective_stop_pct": round(max_effective_stop_pct, 4),
+            },
+            "trailing_exits": {
+                "count": len(trailing_exits),
+                "pnl": round(trailing_pnl, 2),
+            },
+            "normal_exits": {
+                "count": len(normal_exits),
+                "pnl": round(normal_pnl, 2),
+            },
         },
         "symbols": {
             "worst_symbols": [
@@ -235,6 +284,7 @@ def analyze_database(db_path: str) -> dict:
         "integrity": {
             "orphan_trails": len(orphan_trails),
             "duplicate_trades": duplicate_trade_ids,
+            "duplicate_fills": duplicate_fill_ids,
             "unmatched_fills": len(unmatched_fills),
             "nonterminal_partial_orders": len(nonterminal_orders),
             "accounting_mismatch": accounting_mismatch,
@@ -262,14 +312,29 @@ def print_report(res: dict) -> None:
     print(f"  Max Drawdown:        {acct['max_drawdown_pct']:.2f}%")
 
     exc = res["execution"]
-    print("\n[ EXECUTION ]")
+    print("\n[ EXECUTION SUMMARY ]")
     print(f"  Orders Created:      {exc['orders']}")
     print(f"  Fills Created:       {exc['fills']}")
     print(f"  Partial Orders:      {exc['partial_fills']}")
-    print(f"  Average Slippage:    {exc['average_slippage_bps']:.2f} bps")
-    print(f"  P50 Slippage:        {exc['p50_slippage_bps']:.2f} bps")
-    print(f"  P95 Slippage:        {exc['p95_slippage_bps']:.2f} bps")
-    print(f"  Max Slippage:        {exc['max_slippage_bps']:.2f} bps")
+    print(f"  Overall Avg Slip:    {exc['all_slippage']['avg']:.2f} bps (Max: {exc['all_slippage']['max']:.2f} bps)")
+
+    ent = exc["entry_slippage"]
+    print("\n[ ENTRY SLIPPAGE BREAKDOWN ]")
+    print(f"  Entry Fill Count:    {ent['count']}")
+    print(f"  Entry Avg Slippage:  {ent['avg']:.2f} bps")
+    print(f"  Entry P50 Slippage:  {ent['p50']:.2f} bps")
+    print(f"  Entry P95 Slippage:  {ent['p95']:.2f} bps")
+    print(f"  Entry Max Slippage:  {ent['max']:.2f} bps")
+    print(f"  Entries > 25 bps:    {exc['entries_above_limit']}")
+
+    ext = exc["exit_slippage"]
+    print("\n[ EXIT SLIPPAGE BREAKDOWN ]")
+    print(f"  Exit Fill Count:     {ext['count']}")
+    print(f"  Exit Avg Slippage:   {ext['avg']:.2f} bps")
+    print(f"  Exit P50 Slippage:   {ext['p50']:.2f} bps")
+    print(f"  Exit P95 Slippage:   {ext['p95']:.2f} bps")
+    print(f"  Exit Max Slippage:   {ext['max']:.2f} bps")
+    print(f"  Largest Slip Fill:   {exc['largest_slippage_bps']:.2f} bps ({exc['largest_slippage_symbol']}, Order: {exc['largest_slippage_order']})")
 
     trd = res["trading"]
     print("\n[ TRADING ]")
@@ -283,10 +348,13 @@ def print_report(res: dict) -> None:
     print(f"  Average Loss:        ${trd['avg_loss']:.2f}")
 
     exits = res["exit_reasons"]
+    hs = exits["hard_stops"]
     print("\n[ EXIT REASONS ]")
-    print(f"  Hard Stops:          {exits['hard_stops']} (PnL: ${exits['hard_stop_pnl']:,.2f})")
-    print(f"  Trailing Exits:      {exits['trailing_exits']} (PnL: ${exits['trailing_pnl']:,.2f})")
-    print(f"  Other Exits:         {exits['other_exits']}")
+    print(f"  Hard Stops:          {hs['count']} (PnL: ${hs['pnl']:,.2f}, Max Effective Stop: {hs['max_effective_stop_pct']:.2f}%)")
+    te = exits["trailing_exits"]
+    print(f"  Trailing Exits:      {te['count']} (PnL: ${te['pnl']:,.2f})")
+    ne = exits["normal_exits"]
+    print(f"  Normal Exits:        {ne['count']} (PnL: ${ne['pnl']:,.2f})")
 
     syms = res["symbols"]
     print("\n[ SYMBOLS ]")
@@ -313,6 +381,7 @@ def print_report(res: dict) -> None:
     print("\n[ INTEGRITY & RECONCILIATION ]")
     print(f"  Orphan Trails:       {integ['orphan_trails']} {'(PASS)' if integ['orphan_trails'] == 0 else '(FAIL)'}")
     print(f"  Duplicate Trades:    {integ['duplicate_trades']} {'(PASS)' if integ['duplicate_trades'] == 0 else '(FAIL)'}")
+    print(f"  Duplicate Fills:     {integ['duplicate_fills']} {'(PASS)' if integ['duplicate_fills'] == 0 else '(FAIL)'}")
     print(f"  Unmatched Fills:     {integ['unmatched_fills']} {'(PASS)' if integ['unmatched_fills'] == 0 else '(FAIL)'}")
     print(f"  Nonterminal Orders:  {integ['nonterminal_partial_orders']} {'(PASS)' if integ['nonterminal_partial_orders'] == 0 else '(FAIL)'}")
     print(f"  Accounting Match:    {'PASS (Diff=$' + str(integ['cash_vs_expected_diff']) + ')' if not integ['accounting_mismatch'] else 'FAIL'}")

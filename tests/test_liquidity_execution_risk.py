@@ -421,3 +421,23 @@ class TestAdditionalEdgeCases:
         assert acct.state.cash == pytest.approx(10000.0 + trade.net_pnl, rel=1e-5)
         assert len(acct.state.open_positions) == 0
         assert acct.state.allocated == 0.0
+
+    @pytest.mark.asyncio
+    async def test_inner_exception_fails_closed(self):
+        """Unexpected exception in scan loop must mark run as FAILED and halt all entries."""
+        from src.paper.orchestrator import PaperTradingOrchestrator
+        db_path = tempfile.mktemp(suffix=".db")
+        orch = PaperTradingOrchestrator(symbols=["BTCUSDT"], db_path=db_path)
+
+        async def faulty_scan_tick():
+            raise RuntimeError("Deterministic injected inner loop failure")
+
+        orch._scan_tick = faulty_scan_tick
+        report = await orch.start(duration_seconds=2.0)
+
+        assert report.get("status") == "FAILED"
+        assert orch._fatal_error is not None
+        assert not orch._running
+        assert not orch._accepting_new
+        if os.path.exists(db_path):
+            os.unlink(db_path)

@@ -720,11 +720,15 @@ class PaperTradingOrchestrator:
             qty = pos_data.quantity
             book = self.order_book_engine.get_book("binance", sym)
             bids_depth = [(lv[0], lv[1]) for lv in (book.bids.levels if book else [])] if book else None
-            bid = book.best_bid if book and book.best_bid > 0 else self._get_bid(sym)
+            exit_bid = book.best_bid if book and book.best_bid > 0 else self._get_bid(sym)
+            exit_ask = book.best_ask if book and book.best_ask > 0 else ex["price"]
 
             order_id = f"exit-{sym}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
             fill = await self.paper_exec.simulate_fill(
-                sym, "sell", qty, bid=bid, ask=ex["price"], last=ex["price"],
+                sym, "sell", qty,
+                bid=exit_bid,
+                ask=exit_ask,
+                last=ex["price"],
                 bids_depth=bids_depth,
             )
             if fill is None or fill.filled_qty <= 0:
@@ -1021,7 +1025,7 @@ class PaperTradingOrchestrator:
             asks_depth = [(lv[0], lv[1]) for lv in book.asks.levels]
             entry_fill = await self.paper_exec.simulate_fill(
                 sym, "buy", safe_qty,
-                bid=feat.bid, ask=feat.ask, last=feat.last_price,
+                bid=book.best_bid, ask=book.best_ask, last=feat.last_price,
                 asks_depth=asks_depth,
             )
             if not entry_fill or entry_fill.filled_qty <= 0:
@@ -1095,6 +1099,7 @@ class PaperTradingOrchestrator:
             return []
 
         from datetime import timedelta
+
         from src.strategies.base import SignalDirection, StrategySignal
 
         signals = []
@@ -1198,8 +1203,10 @@ class PaperTradingOrchestrator:
         max_slip = max(slips) if slips else 0.0
         p95_slip = sorted(slips)[int(len(slips) * 0.95)] if slips else 0.0
 
+        status = "FAILED" if self._fatal_error else "complete"
         return {
-            "status": "complete",
+            "status": status,
+            "fatal_error": self._fatal_error,
             "duration_seconds": time.monotonic() - self._start_time,
             "wall_seconds": wall_secs,
             "initial_balance": self.initial_balance,

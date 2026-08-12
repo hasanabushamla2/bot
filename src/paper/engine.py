@@ -115,15 +115,18 @@ class PaperExecutionEngine:
 
         # ---- Depth walk execution ----
         if side == "buy":
-            levels = asks_depth or [(ask, 10.0)] if ask > 0 else [(ref_price, 10.0)]
+            levels = asks_depth or ([(ask, 10.0)] if ask > 0 else [(ref_price, 10.0)])
+            best_book_price = levels[0][0] if levels and levels[0][0] > 0 else ref_price
         else:
-            levels = bids_depth or [(bid, 10.0)] if bid > 0 else [(ref_price, 10.0)]
+            levels = bids_depth or ([(bid, 10.0)] if bid > 0 else [(ref_price, 10.0)])
+            best_book_price = levels[0][0] if levels and levels[0][0] > 0 else ref_price
+
         filled, vwap, levels_used, remaining = self.depth_walk(
-            side, quantity, bids=levels, asks=levels, top_of_book=ref_price
+            side, quantity, bids=levels, asks=levels, top_of_book=best_book_price
         )
         if filled <= 0:
             filled = quantity  # fallback to single-level fill
-            vwap = ref_price
+            vwap = best_book_price
             remaining = 0.0
 
         # Apply slippage to VWAP
@@ -135,11 +138,11 @@ class PaperExecutionEngine:
         notional = fill_price * filled
         fees = notional * self.taker_fee
 
-        # Compute adverse slippage bps
+        # Compute adverse slippage bps vs top-of-book
         if side == "buy":
-            bps = (fill_price - ref_price) / ref_price * 10000
+            bps = (fill_price - best_book_price) / best_book_price * 10000
         else:
-            bps = (ref_price - fill_price) / ref_price * 10000
+            bps = (best_book_price - fill_price) / best_book_price * 10000
 
         status = "FILLED"
         if remaining > 0.001:

@@ -202,6 +202,8 @@ async def run_live_paper(
         failures.append("FATAL_ERROR")
     if result.get("persistence_errors", 0) > 0:
         failures.append("PERSISTENCE_ERRORS")
+    if result.get("status") == "FAILED":
+        failures.append("ORCHESTRATOR_FAILED")
     if failures:
         print(f"FAILURES: {failures}")
         return 1
