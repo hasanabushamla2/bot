@@ -64,6 +64,52 @@ class RiskSettings(BaseSettings):
     circuit_breaker_consecutive_losses: int = Field(default=5, ge=1)
 
 
+class PaperTradingSettings(BaseSettings):
+    """Execution/risk protections used by the paper-trading lifecycle.
+
+    Percentage-like edge fields use decimal fractions unless their name ends
+    in ``_pct``.  For example, 0.001 means 0.10% expected edge.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
+
+    loss_cooldown_seconds: float = Field(
+        default=300.0, ge=0.0, validation_alias="LOSS_COOLDOWN_SECONDS"
+    )
+    win_cooldown_seconds: float = Field(
+        default=30.0, ge=0.0, validation_alias="WIN_COOLDOWN_SECONDS"
+    )
+    trail_activation_pct: float = Field(
+        default=0.20, ge=0.0, le=100.0, validation_alias="TRAIL_ACTIVATION_PCT"
+    )
+    trail_distance_pct: float = Field(
+        default=0.20, gt=0.0, le=100.0, validation_alias="TRAIL_DISTANCE_PCT"
+    )
+    max_consecutive_losses_per_symbol: int = Field(
+        default=2, ge=1, validation_alias="MAX_CONSECUTIVE_LOSSES_PER_SYMBOL"
+    )
+    symbol_lockout_seconds: float = Field(
+        default=1800.0, ge=0.0, validation_alias="SYMBOL_LOCKOUT_SECONDS"
+    )
+    symbol_loss_streak_reset_seconds: float = Field(
+        default=21600.0, gt=0.0, validation_alias="SYMBOL_LOSS_STREAK_RESET_SECONDS"
+    )
+    min_expected_edge_over_cost: float = Field(
+        default=0.001, ge=0.0, le=1.0, validation_alias="MIN_EXPECTED_EDGE_OVER_COST"
+    )
+
+    # The paper fill model.  These remain realistic rather than being relaxed
+    # for a short soak test.
+    taker_fee: float = Field(default=0.001, ge=0.0, le=0.1, validation_alias="PAPER_TAKER_FEE")
+    maker_fee: float = Field(default=0.001, ge=0.0, le=0.1, validation_alias="PAPER_MAKER_FEE")
+    slippage_bps: float = Field(
+        default=5.0, ge=0.0, le=1000.0, validation_alias="PAPER_SLIPPAGE_BPS"
+    )
+    simulated_latency_ms: float = Field(
+        default=50.0, ge=0.0, validation_alias="PAPER_SIMULATED_LATENCY_MS"
+    )
+
+
 class ExchangeSettings(BaseSettings):
     """Exchange-specific configuration."""
 
@@ -131,6 +177,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    paper: PaperTradingSettings = Field(default_factory=PaperTradingSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
     mode: ModeSettings = Field(default_factory=ModeSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

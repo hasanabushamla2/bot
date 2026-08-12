@@ -128,7 +128,9 @@ class OpportunityEngine:
         # R7: net_return (decimal fraction) vs min_net_return (also decimal fraction)
         if score.net_return < self.min_net_return:
             opp.status = OpportunityStatus.REJECTED
-            opp.rejection_reason = RejectionReason.OTHER
+            opp.rejection_reason = RejectionReason.INSUFFICIENT_EXPECTED_EDGE
+            opp.metadata["estimated_round_trip_cost_fraction"] = fees + spread + slippage
+            opp.metadata["expected_edge_over_cost"] = score.net_return
             return opp
 
         if score.fill_probability < self.min_fill_probability:
@@ -149,13 +151,19 @@ class OpportunityEngine:
         return evaluated
 
     def _estimate_fees(self, signal: StrategySignal) -> float:
+        if "estimated_fee_fraction" in signal.metadata:
+            return float(signal.metadata["estimated_fee_fraction"])
         taker_fee = float(signal.metadata.get("taker_fee", 0.001))
         return taker_fee * 2  # round trip
 
     def _estimate_spread(self, signal: StrategySignal) -> float:
+        if "estimated_spread_cost_fraction" in signal.metadata:
+            return float(signal.metadata["estimated_spread_cost_fraction"])
         return float(signal.metadata.get("spread_pct", 0.0005))
 
     def _estimate_slippage(self, signal: StrategySignal) -> float:
+        if "estimated_slippage_fraction" in signal.metadata:
+            return float(signal.metadata["estimated_slippage_fraction"])
         base = 0.0005
         if signal.required_capital and signal.required_capital > 5000:
             return base + 0.0005

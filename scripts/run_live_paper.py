@@ -16,6 +16,7 @@ import sys
 import time as time_module
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -35,7 +36,9 @@ def _kucoin_safety_proof() -> None:
     print(f"  KuCoin safety: {len(methods)} public methods, 0 dangerous")
 
 
-async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.Event):
+async def _universe_feed(
+    orch: Any, adapter: Any, symbols: list[str], stop_event: asyncio.Event
+) -> None:
     """Batch-poll ALL symbols via KuCoin allTickers + per-symbol order books.
 
     Uses KuCoin's /api/v1/market/allTickers for efficient mass polling
@@ -98,8 +101,14 @@ async def _universe_feed(orch, adapter, symbols: list[str], stop_event: asyncio.
 
 
 async def run_live_paper(
-    duration: int, symbols: list[str], experiment_id: str, activity_test: bool = False, was_auto_detected: bool = True
-):
+    duration: int,
+    symbols: list[str],
+    experiment_id: str,
+    activity_test: bool = False,
+    was_auto_detected: bool = True,
+    db_path: str | None = None,
+    fresh_db: bool = False,
+) -> int:
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
     from src.paper.orchestrator import PaperTradingOrchestrator
@@ -108,9 +117,16 @@ async def run_live_paper(
                   max_bytes=10 * 1024 * 1024, backup_count=5)
     os.environ["PAPER_EXPERIMENT_ID"] = experiment_id
 
-    db_path = f"data/{experiment_id}.db"
+    db_path = db_path or f"data/{experiment_id}.db"
+    if fresh_db:
+        for candidate in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
+            path = Path(candidate)
+            if path.exists():
+                path.unlink()
+        print("LIVE-PAPER: fresh database requested; prior file removed")
     print(f"LIVE-PAPER: DB={db_path}")
-    print(f"LIVE-PAPER: Symbols={len(symbols)} ('specified' if not was_auto_detected else 'auto-detected')")
+    source_label = "auto-detected" if was_auto_detected else "specified"
+    print(f"LIVE-PAPER: Symbols={len(symbols)} ({source_label})")
     print(f"LIVE-PAPER: Duration={duration}s")
     if activity_test:
         print("LIVE-PAPER: MODE = PAPER ACTIVITY TEST")
@@ -211,11 +227,17 @@ async def run_live_paper(
     return 0
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Live Paper — Dynamic KuCoin Universe")
     parser.add_argument("--duration", type=int, default=600)
     parser.add_argument("--symbols", type=str, default="")
     parser.add_argument("--experiment-id", type=str, default="r26_universe")
+    parser.add_argument("--db-path", type=str, default="")
+    parser.add_argument(
+        "--fresh-db",
+        action="store_true",
+        help="Delete only the selected paper DB (plus WAL/SHM) before starting",
+    )
     parser.add_argument("--activity-test", action="store_true")
     args = parser.parse_args()
 
@@ -262,8 +284,15 @@ async def main():
     print("=" * 70)
     print()
 
-    exit_code = await run_live_paper(args.duration, symbols, exp_id, was_auto_detected=not bool(args.symbols),
-                                     activity_test=args.activity_test)
+    exit_code = await run_live_paper(
+        args.duration,
+        symbols,
+        exp_id,
+        was_auto_detected=not bool(args.symbols),
+        activity_test=args.activity_test,
+        db_path=args.db_path or None,
+        fresh_db=args.fresh_db,
+    )
     sys.exit(exit_code)
 
 

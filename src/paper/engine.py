@@ -12,6 +12,21 @@ logger = get_logger(__name__)
 
 
 @dataclass
+class RoundTripCostEstimate:
+    """Pre-entry round-trip cost estimate in both USD and return-fraction units."""
+
+    notional: float = 0.0
+    estimated_entry_fee: float = 0.0
+    estimated_exit_fee: float = 0.0
+    estimated_spread_cost: float = 0.0
+    estimated_slippage: float = 0.0
+    estimated_round_trip_cost: float = 0.0
+    estimated_round_trip_cost_fraction: float = 0.0
+    entry_fill_price: float = 0.0
+    exit_fill_price: float = 0.0
+
+
+@dataclass
 class PaperFillResult:
     symbol: str = ""
     side: str = ""
@@ -48,6 +63,43 @@ class PaperExecutionEngine:
         self.slippage_bps = slippage_bps
         self.simulated_latency_ms = simulated_latency_ms
         self.partial_fill_probability = partial_fill_probability
+
+    def estimate_round_trip_cost(
+        self,
+        quantity: float,
+        entry_reference_price: float,
+        exit_reference_price: float,
+    ) -> RoundTripCostEstimate:
+        """Estimate realistic round-trip fees, spread/depth, and slippage.
+
+        Reference prices are normally entry/exit book-walk VWAPs.  The
+        configured adverse slippage is then applied to each side exactly as it
+        is in :meth:`simulate_fill`.
+        """
+        if quantity <= 0 or entry_reference_price <= 0 or exit_reference_price <= 0:
+            return RoundTripCostEstimate()
+        slip_fraction = self.slippage_bps / 10000.0
+        entry_fill = entry_reference_price * (1.0 + slip_fraction)
+        exit_fill = exit_reference_price * (1.0 - slip_fraction)
+        notional = entry_reference_price * quantity
+        entry_fee = entry_fill * quantity * self.taker_fee
+        exit_fee = exit_fill * quantity * self.taker_fee
+        entry_slippage = (entry_fill - entry_reference_price) * quantity
+        exit_slippage = (exit_reference_price - exit_fill) * quantity
+        spread_cost = max(0.0, entry_reference_price - exit_reference_price) * quantity
+        modeled_slippage = max(0.0, entry_slippage + exit_slippage)
+        total = entry_fee + exit_fee + spread_cost + modeled_slippage
+        return RoundTripCostEstimate(
+            notional=notional,
+            estimated_entry_fee=entry_fee,
+            estimated_exit_fee=exit_fee,
+            estimated_spread_cost=spread_cost,
+            estimated_slippage=modeled_slippage,
+            estimated_round_trip_cost=total,
+            estimated_round_trip_cost_fraction=(total / notional if notional > 0 else 0.0),
+            entry_fill_price=entry_fill,
+            exit_fill_price=exit_fill,
+        )
 
     # ---- BLOCKER 5: Depth-walk execution ----
     def depth_walk(

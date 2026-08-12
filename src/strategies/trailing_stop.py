@@ -69,6 +69,7 @@ class TrailState:
     trail_level: float = 0.0  # Current exit trigger price
     activated: bool = False  # Has trail been activated?
     activation_price: float = 0.0  # Price at which trail activates
+    activation_pct: float = 0.0  # Effective activation, including the fee-aware floor
 
     # Metrics (recorded at exit)
     entry_time: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -112,6 +113,7 @@ class TrailingStopManager:
         direction: TrailDirection,
         entry_price: float,
         entry_time: datetime | None = None,
+        activation_pct: float | None = None,
     ) -> TrailState:
         """Create a new trail state for an opening position.
 
@@ -120,6 +122,9 @@ class TrailingStopManager:
         favorable direction.
         """
         cfg = self.config
+        effective_activation_pct = (
+            cfg.activation_pct if activation_pct is None else max(0.0, activation_pct)
+        )
         state = TrailState(
             symbol=symbol,
             direction=direction,
@@ -128,13 +133,16 @@ class TrailingStopManager:
             peak_price=entry_price,
             trail_level=entry_price,  # No trail until activated
             entry_time=entry_time or datetime.now(UTC),
+            activation_pct=effective_activation_pct,
         )
 
-        # Compute activation price
+        # Compute activation price.  PositionMonitor may provide a higher,
+        # cost-derived floor so an activated trail protects net profit rather
+        # than acting as a second loss stop.
         if direction == TrailDirection.LONG:
-            state.activation_price = entry_price * (1.0 + cfg.activation_pct / 100.0)
+            state.activation_price = entry_price * (1.0 + effective_activation_pct / 100.0)
         else:
-            state.activation_price = entry_price * (1.0 - cfg.activation_pct / 100.0)
+            state.activation_price = entry_price * (1.0 - effective_activation_pct / 100.0)
 
         return state
 
@@ -183,13 +191,17 @@ class TrailingStopManager:
                     state.activated = True
 
         # --- Update trail level ---
-        if state.activated and is_new_peak:
-            state.trail_level = self._compute_trail_level(state)
-            state.trail_updates += 1
-
-        # Set initial trail on activation
-        if state.activated and state.trail_level == state.entry_price:
-            state.trail_level = self._compute_trail_level(state)
+        # The threshold ratchets only in the favorable direction.  Initializing
+        # it at entry also prevents an activated trail from becoming a loss-side
+        # stop; the independent hard stop owns that responsibility.
+        if state.activated and (is_new_peak or state.trail_level == state.entry_price):
+            candidate = self._compute_trail_level(state)
+            if state.direction == TrailDirection.LONG:
+                state.trail_level = max(state.trail_level, candidate)
+            else:
+                state.trail_level = min(state.trail_level, candidate)
+            if is_new_peak:
+                state.trail_updates += 1
 
         # --- Compute protected profit ---
         if state.entry_price > 0:
@@ -342,5 +354,6 @@ def compute_trail_config(
         algorithm=TrailAlgorithm.PERCENTAGE,
         trail_pct=trail_pct,
         activation_pct=activation_pct,
+        trailing_delta=trail_pct / 100.0,
         enable_fixed_take_profit=False,  # PERMANENTLY DISABLED
     )

@@ -103,7 +103,50 @@ Before enabling live trading:
 
 ---
 
-## 7. Paper Trading Metrics
+## 7. One-hour execution/risk soak
+
+Use a clean database and the public-market paper runner. `--fresh-db` removes
+only the selected SQLite database (and its WAL/SHM sidecars) before startup.
+It does not change fees, slippage, sizing, strategy logic, or risk rules.
+
+```powershell
+python .\scripts\run_live_paper.py --duration 3600 --experiment-id full_soak_1h --db-path data/full_soak_1h.db --fresh-db
+```
+
+Inspect a fact-only snapshot from another PowerShell window:
+
+```powershell
+python .\scripts\analyze_paper_run.py data\full_soak_1h.db
+Get-Content .\logs\engine.log -Tail 100 -Wait
+```
+
+The report separates reference-price gross PnL, fees, modeled slippage, and
+net PnL. A one-hour run is an execution-health gate, not evidence that the
+strategy is profitable.
+
+### Execution/risk configuration
+
+| Environment variable | Default | Meaning |
+|---|---:|---|
+| `LOSS_COOLDOWN_SECONDS` | `300` | Minimum same-symbol delay after a net loss |
+| `WIN_COOLDOWN_SECONDS` | `30` | Shorter delay after a net win |
+| `TRAIL_ACTIVATION_PCT` | `0.20` | Configured activation floor; runtime raises it when costs require |
+| `TRAIL_DISTANCE_PCT` | `0.20` | Favorable high-water-mark trail distance |
+| `MAX_CONSECUTIVE_LOSSES_PER_SYMBOL` | `2` | Loss count that triggers temporary lockout |
+| `SYMBOL_LOCKOUT_SECONDS` | `1800` | Temporary lockout after the threshold |
+| `SYMBOL_LOSS_STREAK_RESET_SECONDS` | `21600` | Inactivity interval that decays a loss streak |
+| `MIN_EXPECTED_EDGE_OVER_COST` | `0.001` | Required expected-return margin over estimated round-trip cost |
+| `PAPER_TAKER_FEE` | `0.001` | Fee rate on each simulated market fill |
+| `PAPER_MAKER_FEE` | `0.001` | Maker fee setting (market path currently uses taker rate) |
+| `PAPER_SLIPPAGE_BPS` | `5.0` | Adverse modeled slippage applied on each side |
+| `PAPER_SIMULATED_LATENCY_MS` | `50.0` | Simulated order latency |
+
+A consumed signal remains blocked after cooldown until its strategy condition
+has been observed false and subsequently becomes valid again. Explicit stable
+`signal_id` values from event-driven strategy plugins are also supported.
+Cooldown and signal-consumption state are persisted in the soak database.
+
+## 8. Paper Trading Metrics
 
 Same metrics as live trading:
 - Win rate, P&L, Sharpe, Sortino, drawdown.

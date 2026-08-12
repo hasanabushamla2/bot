@@ -39,8 +39,11 @@ class StrategySignal:
     Engine consumes signals and decides whether to act on them.
     """
 
-    # Identity
+    # Identity.  ``signal_id`` is optional for strategy plugins; the paper
+    # lifecycle assigns a durable regime id when a plugin does not provide an
+    # event id of its own.
     strategy_id: str
+    signal_id: str = ""
     strategy_version: str = "1.0.0"
 
     # Market targeting

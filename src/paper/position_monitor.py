@@ -40,7 +40,14 @@ class PositionMonitor:
 
     def register_position(self, pos: PaperPosition) -> None:
         direction = TrailDirection.LONG if pos.direction == "long" else TrailDirection.SHORT
-        ts = self.trail_manager.initialize(pos.symbol, direction, pos.entry_price, pos.entry_time)
+        activation_pct = pos.trail_activation_pct or self.trail_manager.config.activation_pct
+        ts = self.trail_manager.initialize(
+            pos.symbol,
+            direction,
+            pos.entry_price,
+            pos.entry_time,
+            activation_pct=activation_pct,
+        )
         self._trail_states[pos.symbol] = ts
         self._exit_intents.discard(pos.symbol)
 
@@ -52,8 +59,15 @@ class PositionMonitor:
         sym = pos.symbol
         if sym in self._exit_intents:
             return None  # Already triggered
-        # Hard stop
-        if pos.stop_loss_price > 0 and pos.direction == "long" and price <= pos.stop_loss_price:
+        # Hard stop is independent of, and checked before, profit trailing.
+        hard_stop_hit = (
+            pos.stop_loss_price > 0
+            and (
+                (pos.direction == "long" and price <= pos.stop_loss_price)
+                or (pos.direction == "short" and price >= pos.stop_loss_price)
+            )
+        )
+        if hard_stop_hit:
             self._exit_intents.add(sym)
             return {
                 "symbol": sym,
@@ -66,7 +80,15 @@ class PositionMonitor:
         ts = self._trail_states.get(sym)
         if ts is None:
             direction = TrailDirection.LONG if pos.direction == "long" else TrailDirection.SHORT
-            ts = self.trail_manager.initialize(sym, direction, pos.entry_price, pos.entry_time)
+            ts = self.trail_manager.initialize(
+                sym,
+                direction,
+                pos.entry_price,
+                pos.entry_time,
+                activation_pct=(
+                    pos.trail_activation_pct or self.trail_manager.config.activation_pct
+                ),
+            )
             self._trail_states[sym] = ts
         self.trail_manager.update(ts, price)
         pos.trail_peak = ts.peak_price
@@ -110,6 +132,8 @@ class PositionMonitor:
             "entry_price": ts.entry_price,
             "peak_price": ts.peak_price,
             "trail_level": ts.trail_level,
+            "activation_price": ts.activation_price,
+            "activation_pct": ts.activation_pct,
             "activated": ts.activated,
             "exit_intent": symbol in self._exit_intents,
         }
@@ -117,9 +141,15 @@ class PositionMonitor:
     def restore_trail_state(self, saved: dict[str, Any]) -> None:
         sym = saved["symbol"]
         direction = TrailDirection.LONG if saved["direction"] == "long" else TrailDirection.SHORT
-        ts = self.trail_manager.initialize(sym, direction, saved["entry_price"])
+        ts = self.trail_manager.initialize(
+            sym,
+            direction,
+            saved["entry_price"],
+            activation_pct=saved.get("activation_pct"),
+        )
         ts.peak_price = saved["peak_price"]
         ts.trail_level = saved["trail_level"]
+        ts.activation_price = saved.get("activation_price", ts.activation_price)
         ts.activated = saved["activated"]
         self._trail_states[sym] = ts
         if saved.get("exit_intent"):

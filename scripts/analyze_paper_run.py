@@ -1,401 +1,438 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""Database Analysis Tool — analyze paper run from SQLite DB facts only.
+"""Fact-only report for a paper-trading SQLite database.
 
 Usage:
-    python scripts/analyze_paper_run.py <db_path>
+    python scripts/analyze_paper_run.py data/full_soak_1h.db
+    python scripts/analyze_paper_run.py data/full_soak_1h.db --json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sqlite3
+import statistics
 import sys
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
-def _calc_stats(values: list[float]) -> dict:
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _value(row: sqlite3.Row | None, key: str, default: Any = 0.0) -> Any:
+    if row is None:
+        return default
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+def _float(row: sqlite3.Row | None, key: str, default: float = 0.0) -> float:
+    try:
+        return float(_value(row, key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _holding_seconds(row: sqlite3.Row) -> float:
+    stored = _float(row, "holding_seconds", -1.0)
+    if stored >= 0:
+        return stored
+    try:
+        return max(
+            0.0,
+            (
+                datetime.fromisoformat(str(row["exit_time"]))
+                - datetime.fromisoformat(str(row["entry_time"]))
+            ).total_seconds(),
+        )
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def _slippage_stats(values: list[float]) -> dict[str, float | int]:
     if not values:
         return {"count": 0, "avg": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
-    s = sorted(values)
+    ordered = sorted(values)
     return {
-        "count": len(s),
-        "avg": round(sum(s) / len(s), 2),
-        "p50": round(s[int(len(s) * 0.50)], 2),
-        "p95": round(s[int(len(s) * 0.95)], 2),
-        "max": round(max(s), 2),
+        "count": len(ordered),
+        "avg": sum(ordered) / len(ordered),
+        "p50": statistics.median(ordered),
+        "p95": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+        "max": max(ordered),
     }
 
 
-def analyze_database(db_path: str) -> dict:
-    if not Path(db_path).exists():
-        print(f"ERROR: Database file not found: {db_path}")
-        sys.exit(1)
+def analyze_database(db_path: str) -> dict[str, Any]:
+    path = Path(db_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Database file not found: {db_path}")
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
 
-    # 1. ACCOUNT
-    acct_row = conn.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
-    if not acct_row:
-        initial_equity = 10000.0
-        ending_equity = 10000.0
-        realized_pnl = 0.0
-        total_fees = 0.0
-        total_slippage = 0.0
-        max_drawdown = 0.0
-        cash = 10000.0
-    else:
-        initial_equity = float(acct_row["initial_balance"])
-        cash = float(acct_row["cash"])
-        realized_pnl = float(acct_row["realized_pnl"])
-        total_fees = float(acct_row["total_fees"])
-        total_slippage = float(acct_row["total_slippage"])
-        max_drawdown = float(acct_row["max_drawdown_pct"])
-        open_pos_rows = conn.execute("SELECT * FROM paper_positions WHERE is_open=1").fetchall()
-        open_notional = sum(float(r["entry_notional"]) for r in open_pos_rows)
-        ending_equity = cash + open_notional
+    account = (
+        conn.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
+        if _table_exists(conn, "paper_account")
+        else None
+    )
+    initial_balance = _float(account, "initial_balance", 10_000.0)
+    cash = _float(account, "cash", initial_balance)
+    allocated = _float(account, "allocated", 0.0)
+    unrealized_pnl = _float(account, "unrealized_pnl", 0.0)
+    realized_pnl = _float(account, "realized_pnl", 0.0)
+    final_equity = _float(account, "equity", cash + allocated + unrealized_pnl)
+    if final_equity == 0.0 and account is not None:
+        final_equity = cash + allocated + unrealized_pnl
 
-    # 2. ORDERS & FILLS
-    orders = conn.execute("SELECT * FROM paper_orders").fetchall()
-    fills = conn.execute("SELECT * FROM paper_fills").fetchall()
+    positions = (
+        conn.execute("SELECT * FROM paper_positions WHERE is_open=1").fetchall()
+        if _table_exists(conn, "paper_positions")
+        else []
+    )
+    orders = (
+        conn.execute("SELECT * FROM paper_orders ORDER BY created_at").fetchall()
+        if _table_exists(conn, "paper_orders")
+        else []
+    )
+    fills = (
+        conn.execute("SELECT * FROM paper_fills ORDER BY filled_at").fetchall()
+        if _table_exists(conn, "paper_fills")
+        else []
+    )
+    trades = (
+        conn.execute("SELECT * FROM paper_closed_trades ORDER BY exit_time").fetchall()
+        if _table_exists(conn, "paper_closed_trades")
+        else []
+    )
+    runtime_metrics = (
+        {
+            str(row["metric_name"]): float(row["metric_value"])
+            for row in conn.execute(
+                "SELECT metric_name,metric_value FROM paper_runtime_metrics"
+            )
+        }
+        if _table_exists(conn, "paper_runtime_metrics")
+        else {}
+    )
 
-    partial_fills = [o for o in orders if "PARTIAL" in str(o["status"]).upper()]
-    nonterminal_orders = [
-        o for o in orders if str(o["status"]).upper() in ("NEW", "OPEN", "PARTIALLY_FILLED", "PENDING")
-    ]
-    partially_filled_canceled = [
-        o for o in orders if str(o["status"]).upper() == "PARTIALLY_FILLED_CANCELED"
-    ]
+    net_values = [_float(trade, "net_pnl") for trade in trades]
+    gross_values = [_float(trade, "gross_pnl") for trade in trades]
+    fee_values = [_float(trade, "fees") for trade in trades]
+    trade_slippage_values = [_float(trade, "slippage_cost") for trade in trades]
+    wins = [value for value in net_values if value > 0]
+    losses = [value for value in net_values if value <= 0]
+    gross_profit_for_factor = sum(wins)
+    gross_loss_for_factor = abs(sum(losses))
+    profit_factor: float | None = (
+        gross_profit_for_factor / gross_loss_for_factor
+        if gross_loss_for_factor > 0
+        else None
+    )
 
-    # Separated Fills by Side
-    entry_fills = [f for f in fills if str(f["side"]).lower() == "buy"]
-    exit_fills = [f for f in fills if str(f["side"]).lower() == "sell"]
+    holding_values = [_holding_seconds(trade) for trade in trades]
+    exit_reasons = Counter(str(_value(trade, "exit_reason", "unknown")) for trade in trades)
+    trades_per_symbol = Counter(str(_value(trade, "symbol", "unknown")) for trade in trades)
+    pnl_per_symbol: dict[str, float] = defaultdict(float)
+    for trade in trades:
+        pnl_per_symbol[str(_value(trade, "symbol", "unknown"))] += _float(
+            trade, "net_pnl"
+        )
 
-    entry_slips = [float(f["slippage_bps"]) for f in entry_fills if f["slippage_bps"] is not None]
-    exit_slips = [float(f["slippage_bps"]) for f in exit_fills if f["slippage_bps"] is not None]
-    all_slips = [float(f["slippage_bps"]) for f in fills if f["slippage_bps"] is not None]
+    entry_fills = [fill for fill in fills if str(_value(fill, "side", "")).lower() == "buy"]
+    exit_fills = [fill for fill in fills if str(_value(fill, "side", "")).lower() == "sell"]
+    entry_slippage_bps = [_float(fill, "slippage_bps") for fill in entry_fills]
+    exit_slippage_bps = [_float(fill, "slippage_bps") for fill in exit_fills]
+    all_slippage_bps = [_float(fill, "slippage_bps") for fill in fills]
 
-    entry_stats = _calc_stats(entry_slips)
-    exit_stats = _calc_stats(exit_slips)
-    all_stats = _calc_stats(all_slips)
-
-    entries_above_limit = len([s for s in entry_slips if s > 25.0])
-
-    # Find largest slippage fill
-    largest_slip_val = 0.0
-    largest_slip_sym = "NONE"
-    largest_slip_order = "NONE"
-    for f in fills:
-        if f["slippage_bps"] is not None and float(f["slippage_bps"]) > largest_slip_val:
-            largest_slip_val = float(f["slippage_bps"])
-            largest_slip_sym = f["symbol"]
-            largest_slip_order = f["order_id"]
-
-    # 3. TRADING (CLOSED TRADES)
-    trades = conn.execute("SELECT * FROM paper_closed_trades ORDER BY exit_time ASC").fetchall()
     trade_count = len(trades)
-    wins = [t for t in trades if float(t["net_pnl"]) > 0]
-    losses = [t for t in trades if float(t["net_pnl"]) <= 0]
-    win_count = len(wins)
-    loss_count = len(losses)
-    win_rate = (win_count / trade_count * 100.0) if trade_count > 0 else 0.0
+    closed_gross_pnl = sum(gross_values)
+    closed_fees = sum(fee_values)
+    closed_slippage = sum(trade_slippage_values)
+    closed_costs = closed_fees + closed_slippage
+    closed_net_pnl = sum(net_values)
+    total_fees = _float(account, "total_fees", sum(_float(fill, "fees") for fill in fills))
+    total_slippage = _float(account, "total_slippage", closed_slippage)
 
-    gross_pnl_total = sum(float(t["gross_pnl"]) for t in trades)
-    net_pnl_total = sum(float(t["net_pnl"]) for t in trades)
-    win_pnl_total = sum(float(t["net_pnl"]) for t in wins)
-    loss_pnl_total = sum(float(t["net_pnl"]) for t in losses)
-
-    avg_win = (win_pnl_total / win_count) if win_count > 0 else 0.0
-    avg_loss = (loss_pnl_total / loss_count) if loss_count > 0 else 0.0
-    profit_factor = (
-        (win_pnl_total / abs(loss_pnl_total))
-        if loss_pnl_total < 0
-        else (99.0 if win_pnl_total > 0 else 1.0)
-    )
-    expectancy = (net_pnl_total / trade_count) if trade_count > 0 else 0.0
-
-    # 4. EXIT REASONS & CATEGORIZED SLIPPAGES
-    hard_stops = [t for t in trades if t["exit_reason"] in ("hard_stop", "stop_loss")]
-    trailing_exits = [t for t in trades if t["exit_reason"] == "trail_hit"]
-    normal_exits = [
-        t for t in trades if t["exit_reason"] not in ("hard_stop", "stop_loss", "trail_hit")
+    partial_orders = [
+        order for order in orders if "PARTIAL" in str(_value(order, "status", "")).upper()
     ]
-
-    hard_stop_pnl = sum(float(t["net_pnl"]) for t in hard_stops)
-    trailing_pnl = sum(float(t["net_pnl"]) for t in trailing_exits)
-    normal_pnl = sum(float(t["net_pnl"]) for t in normal_exits)
-
-    max_effective_stop_pct = max(
-        [abs(float(t["return_pct"])) for t in hard_stops], default=0.0
+    nonterminal_orders = [
+        order
+        for order in orders
+        if str(_value(order, "status", "")).upper()
+        in {"NEW", "OPEN", "PARTIALLY_FILLED", "PENDING"}
+    ]
+    order_ids = {str(_value(order, "order_id", "")) for order in orders}
+    unmatched_fills = [
+        fill for fill in fills if str(_value(fill, "order_id", "")) not in order_ids
+    ]
+    trade_ids = [str(_value(trade, "trade_id", "")) for trade in trades]
+    fill_ids = [str(_value(fill, "fill_id", "")) for fill in fills]
+    orphan_trails = (
+        conn.execute(
+            "SELECT COUNT(*) FROM paper_trail WHERE position_id NOT IN "
+            "(SELECT position_id FROM paper_positions WHERE is_open=1)"
+        ).fetchone()[0]
+        if _table_exists(conn, "paper_trail") and _table_exists(conn, "paper_positions")
+        else 0
     )
 
-    # 5. SYMBOLS
-    sym_stats: dict[str, dict] = {}
-    for t in trades:
-        sym = t["symbol"]
-        if sym not in sym_stats:
-            sym_stats[sym] = {
-                "trades": 0, "net_pnl": 0.0, "wins": 0, "losses": 0,
-                "stopouts": 0, "slippages": [],
-            }
-        s = sym_stats[sym]
-        s["trades"] += 1
-        pnl = float(t["net_pnl"])
-        s["net_pnl"] += pnl
-        if pnl > 0:
-            s["wins"] += 1
-        else:
-            s["losses"] += 1
-        if t["exit_reason"] in ("hard_stop", "stop_loss"):
-            s["stopouts"] += 1
-
-    for f in fills:
-        sym = f["symbol"]
-        if sym in sym_stats and f["slippage_bps"] is not None:
-            sym_stats[sym]["slippages"].append(float(f["slippage_bps"]))
-
-    sorted_syms = sorted(sym_stats.items(), key=lambda kv: kv[1]["net_pnl"])
-    worst_symbols = sorted_syms[:5]
-    best_symbols = sorted_syms[-5:][::-1] if len(sorted_syms) >= 5 else sorted_syms[::-1]
-    largest_single_symbol_loss = min((s["net_pnl"] for s in sym_stats.values()), default=0.0)
-    worst_symbol_name = worst_symbols[0][0] if worst_symbols else "NONE"
-
-    # 6. STRATEGIES
-    strat_stats: dict[str, dict] = {}
-    for t in trades:
-        sid = t["strategy_id"] or "unknown"
-        if sid not in strat_stats:
-            strat_stats[sid] = {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
-        st = strat_stats[sid]
-        st["trades"] += 1
-        pnl = float(t["net_pnl"])
-        st["net_pnl"] += pnl
-        if pnl > 0:
-            st["wins"] += 1
-        else:
-            st["losses"] += 1
-
-    # 7. RISK
-    risk_row = conn.execute("SELECT * FROM paper_risk WHERE id=1").fetchone()
-    circuit_breaker_active = bool(risk_row["breaker_active"]) if risk_row else False
-
-    # 8. INTEGRITY CHECKS
-    orphan_trails = conn.execute(
-        "SELECT position_id FROM paper_trail WHERE position_id NOT IN (SELECT position_id FROM paper_positions WHERE is_open=1)"
-    ).fetchall()
-
-    trade_ids = [t["trade_id"] for t in trades]
-    duplicate_trade_ids = len(trade_ids) - len(set(trade_ids))
-
-    fill_ids = [f["fill_id"] for f in fills]
-    duplicate_fill_ids = len(fill_ids) - len(set(fill_ids))
-
-    open_pos_rows = conn.execute("SELECT * FROM paper_positions WHERE is_open=1").fetchall()
     open_cost_basis = sum(
-        float(r["cost_basis"]) if "cost_basis" in r else float(r["entry_notional"]) + float(r["entry_fee"])
-        for r in open_pos_rows
+        _float(position, "entry_notional") + _float(position, "entry_fee")
+        for position in positions
     )
-    expected_cash = initial_equity - open_cost_basis + net_pnl_total
-    accounting_mismatch = abs(cash - expected_cash) > 0.01
+    expected_cash = initial_balance + realized_pnl - open_cost_basis
+    cash_diff = abs(cash - expected_cash)
+    realized_diff = abs(realized_pnl - closed_net_pnl)
+    trade_reconciliation_errors = sum(
+        1
+        for gross, fees, slippage, net in zip(
+            gross_values, fee_values, trade_slippage_values, net_values, strict=True
+        )
+        if abs(gross - fees - slippage - net) > 1e-6
+    )
+    fill_fee_total = sum(_float(fill, "fees") for fill in fills)
+    fee_diff = abs(total_fees - fill_fee_total)
 
-    order_ids = {o["order_id"] for o in orders}
-    unmatched_fills = [f for f in fills if f["order_id"] not in order_ids]
-
+    risk_row = (
+        conn.execute("SELECT * FROM paper_risk WHERE id=1").fetchone()
+        if _table_exists(conn, "paper_risk")
+        else None
+    )
     conn.close()
 
-    result = {
+    result: dict[str, Any] = {
         "db_path": db_path,
         "account": {
-            "initial_equity": initial_equity,
-            "ending_equity": ending_equity,
+            "initial_balance": initial_balance,
             "cash": cash,
-            "realized_pnl": realized_pnl,
-            "net_pnl_from_trades": net_pnl_total,
-            "total_fees": total_fees,
-            "total_slippage": total_slippage,
-            "max_drawdown_pct": max_drawdown,
+            "allocated": allocated,
+            "unrealized_pnl": unrealized_pnl,
+            "realized_net_pnl": realized_pnl,
+            "final_equity": final_equity,
+            "net_pnl": final_equity - initial_balance,
+            "peak_equity": _float(account, "peak_equity", initial_balance),
+            "max_drawdown_pct": _float(account, "max_drawdown_pct", 0.0),
+            "open_positions": len(positions),
+        },
+        "costs": {
+            "gross_pnl_before_costs_closed": closed_gross_pnl,
+            "closed_trade_fees": closed_fees,
+            "closed_trade_slippage": closed_slippage,
+            "closed_total_trading_costs": closed_costs,
+            "net_realized_after_costs": closed_net_pnl,
+            "account_total_fees_including_open_entries": total_fees,
+            "account_total_slippage_including_open_entries": total_slippage,
+            "account_total_costs_including_open_entries": total_fees + total_slippage,
+        },
+        "trading": {
+            "trade_count": trade_count,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate_pct": len(wins) / trade_count * 100.0 if trade_count else 0.0,
+            "profit_factor": profit_factor,
+            "average_win": statistics.mean(wins) if wins else 0.0,
+            "average_loss": statistics.mean(losses) if losses else 0.0,
+            "largest_win": max(wins) if wins else 0.0,
+            "largest_loss": min(losses) if losses else 0.0,
+            "average_holding_seconds": (
+                statistics.mean(holding_values) if holding_values else 0.0
+            ),
+            "median_holding_seconds": (
+                statistics.median(holding_values) if holding_values else 0.0
+            ),
+            "exit_reason_distribution": dict(sorted(exit_reasons.items())),
+            "trades_per_symbol": dict(sorted(trades_per_symbol.items())),
+            "net_pnl_per_symbol": dict(sorted(pnl_per_symbol.items())),
+        },
+        "entry_protection": {
+            "rejected_entries": int(runtime_metrics.get("rejected_entries", 0)),
+            "rejected_cooldown": int(runtime_metrics.get("cooldown_rejections", 0)),
+            "rejected_duplicate_or_stale_signal": int(
+                runtime_metrics.get("duplicate_signal_rejections", 0)
+            ),
+            "rejected_insufficient_expected_edge": int(
+                runtime_metrics.get("expected_edge_rejections", 0)
+            ),
+            "consecutive_loss_events": int(
+                runtime_metrics.get("consecutive_loss_events", 0)
+            ),
+            "reentry_attempts_prevented": int(
+                runtime_metrics.get("reentry_attempts_prevented", 0)
+            ),
         },
         "execution": {
             "orders": len(orders),
             "fills": len(fills),
-            "partial_fills": len(partial_fills),
+            "partial_orders": len(partial_orders),
             "nonterminal_orders": len(nonterminal_orders),
-            "partially_filled_canceled": len(partially_filled_canceled),
-            "all_slippage": all_stats,
-            "entry_slippage": entry_stats,
-            "exit_slippage": exit_stats,
-            "entries_above_limit": entries_above_limit,
-            "largest_slippage_bps": largest_slip_val,
-            "largest_slippage_symbol": largest_slip_sym,
-            "largest_slippage_order": largest_slip_order,
+            "entry_slippage_bps": _slippage_stats(entry_slippage_bps),
+            "exit_slippage_bps": _slippage_stats(exit_slippage_bps),
+            "all_slippage_bps": _slippage_stats(all_slippage_bps),
         },
-        "trading": {
-            "trades": trade_count,
-            "wins": win_count,
-            "losses": loss_count,
-            "win_rate": round(win_rate, 2),
-            "expectancy": round(expectancy, 4),
-            "avg_win": round(avg_win, 2),
-            "avg_loss": round(avg_loss, 2),
-            "profit_factor": round(profit_factor, 2),
-            "gross_pnl": round(gross_pnl_total, 2),
-            "net_pnl": round(net_pnl_total, 2),
-        },
-        "exit_reasons": {
-            "hard_stops": {
-                "count": len(hard_stops),
-                "pnl": round(hard_stop_pnl, 2),
-                "max_effective_stop_pct": round(max_effective_stop_pct, 4),
-            },
-            "trailing_exits": {
-                "count": len(trailing_exits),
-                "pnl": round(trailing_pnl, 2),
-            },
-            "normal_exits": {
-                "count": len(normal_exits),
-                "pnl": round(normal_pnl, 2),
-            },
-        },
-        "symbols": {
-            "worst_symbols": [
-                {"symbol": k, "pnl": round(v["net_pnl"], 2), "trades": v["trades"], "stopouts": v["stopouts"]}
-                for k, v in worst_symbols
-            ],
-            "best_symbols": [
-                {"symbol": k, "pnl": round(v["net_pnl"], 2), "trades": v["trades"], "stopouts": v["stopouts"]}
-                for k, v in best_symbols
-            ],
-            "largest_single_symbol_loss": round(largest_single_symbol_loss, 2),
-            "worst_symbol": worst_symbol_name,
-        },
-        "strategies": {
-            sid: {
-                "trades": v["trades"], "wins": v["wins"], "losses": v["losses"],
-                "win_rate": round(v["wins"] / v["trades"] * 100.0, 2) if v["trades"] > 0 else 0.0,
-                "net_pnl": round(v["net_pnl"], 2),
-                "expectancy": round(v["net_pnl"] / v["trades"], 4) if v["trades"] > 0 else 0.0,
-            }
-            for sid, v in strat_stats.items()
+        "health": {
+            "exceptions": int(runtime_metrics.get("exceptions", 0)),
+            "persistence_errors": int(runtime_metrics.get("persistence_errors", 0)),
+            "stale_feed_violation": bool(
+                runtime_metrics.get("stale_feed_violation", 0)
+            ),
+            "stale_market_rejections": int(
+                runtime_metrics.get("stale_market_rejections", 0)
+            ),
+            "risk_rejections": int(runtime_metrics.get("risk_rejections", 0)),
+            "signals_generated": int(runtime_metrics.get("signals_generated", 0)),
+            "opportunities_evaluated": int(
+                runtime_metrics.get("opportunities_evaluated", 0)
+            ),
         },
         "risk": {
-            "circuit_breaker_active": circuit_breaker_active,
+            "circuit_breaker_active": bool(_value(risk_row, "breaker_active", 0)),
         },
         "integrity": {
-            "orphan_trails": len(orphan_trails),
-            "duplicate_trades": duplicate_trade_ids,
-            "duplicate_fills": duplicate_fill_ids,
+            "orphan_trails": int(orphan_trails),
+            "duplicate_trades": len(trade_ids) - len(set(trade_ids)),
+            "duplicate_fills": len(fill_ids) - len(set(fill_ids)),
             "unmatched_fills": len(unmatched_fills),
-            "nonterminal_partial_orders": len(nonterminal_orders),
-            "accounting_mismatch": accounting_mismatch,
-            "cash_vs_expected_diff": round(abs(cash - expected_cash), 4),
+            "nonterminal_orders": len(nonterminal_orders),
+            "cash_expected": expected_cash,
+            "cash_vs_expected_diff": cash_diff,
+            "realized_vs_closed_trade_diff": realized_diff,
+            "account_fees_vs_fill_fees_diff": fee_diff,
+            "trade_reconciliation_errors": trade_reconciliation_errors,
+            "accounting_invariants_pass": (
+                cash_diff <= 0.01
+                and realized_diff <= 0.01
+                and fee_diff <= 0.01
+                and trade_reconciliation_errors == 0
+                and math.isfinite(final_equity)
+            ),
         },
     }
-
     return result
 
 
-def print_report(res: dict) -> None:
-    print("=" * 70)
-    print("  PAPER TRADING DATABASE AUDIT & ANALYSIS")
-    print(f"  Database: {res['db_path']}")
-    print("=" * 70)
+def _money(value: float) -> str:
+    return f"${value:,.4f}"
 
-    acct = res["account"]
+
+def print_report(report: dict[str, Any]) -> None:
+    account = report["account"]
+    costs = report["costs"]
+    trading = report["trading"]
+    protection = report["entry_protection"]
+    execution = report["execution"]
+    health = report["health"]
+    integrity = report["integrity"]
+
+    print("=" * 78)
+    print("  PAPER TRADING SOAK REPORT — DATABASE FACTS ONLY")
+    print(f"  Database: {report['db_path']}")
+    print("=" * 78)
     print("\n[ ACCOUNT ]")
-    print(f"  Starting Equity:     ${acct['initial_equity']:,.2f}")
-    print(f"  Ending Equity:       ${acct['ending_equity']:,.2f}")
-    print(f"  Cash Balance:        ${acct['cash']:,.2f}")
-    print(f"  Realized PnL:        ${acct['realized_pnl']:,.2f}")
-    print(f"  Total Fees:          ${acct['total_fees']:,.4f}")
-    print(f"  Total Slippage Cost: ${acct['total_slippage']:,.4f}")
-    print(f"  Max Drawdown:        {acct['max_drawdown_pct']:.2f}%")
+    print(f"  Initial balance:       {_money(account['initial_balance'])}")
+    print(f"  Final equity:          {_money(account['final_equity'])}")
+    print(f"  Net PnL (equity):      {_money(account['net_pnl'])}")
+    print(f"  Realized net PnL:      {_money(account['realized_net_pnl'])}")
+    print(f"  Unrealized PnL:        {_money(account['unrealized_pnl'])}")
+    print(f"  Cash / allocated:      {_money(account['cash'])} / {_money(account['allocated'])}")
+    print(f"  Open positions:        {account['open_positions']}")
+    print(f"  Max drawdown:          {account['max_drawdown_pct']:.6f}%")
 
-    exc = res["execution"]
-    print("\n[ EXECUTION SUMMARY ]")
-    print(f"  Orders Created:      {exc['orders']}")
-    print(f"  Fills Created:       {exc['fills']}")
-    print(f"  Partial Orders:      {exc['partial_fills']}")
-    print(f"  Overall Avg Slip:    {exc['all_slippage']['avg']:.2f} bps (Max: {exc['all_slippage']['max']:.2f} bps)")
+    print("\n[ GROSS → COSTS → NET (CLOSED TRADES) ]")
+    print(f"  Gross PnL before costs:{_money(costs['gross_pnl_before_costs_closed']):>16}")
+    print(f"  Fees:                  {_money(costs['closed_trade_fees']):>16}")
+    print(f"  Slippage:              {_money(costs['closed_trade_slippage']):>16}")
+    print(f"  Total trading costs:   {_money(costs['closed_total_trading_costs']):>16}")
+    print(f"  Net profit after costs:{_money(costs['net_realized_after_costs']):>16}")
+    print("  (Account totals include costs already paid on any still-open entries.)")
+    print(f"  Account total fees:    {_money(costs['account_total_fees_including_open_entries']):>16}")
+    print(f"  Account total slippage:{_money(costs['account_total_slippage_including_open_entries']):>16}")
 
-    ent = exc["entry_slippage"]
-    print("\n[ ENTRY SLIPPAGE BREAKDOWN ]")
-    print(f"  Entry Fill Count:    {ent['count']}")
-    print(f"  Entry Avg Slippage:  {ent['avg']:.2f} bps")
-    print(f"  Entry P50 Slippage:  {ent['p50']:.2f} bps")
-    print(f"  Entry P95 Slippage:  {ent['p95']:.2f} bps")
-    print(f"  Entry Max Slippage:  {ent['max']:.2f} bps")
-    print(f"  Entries > 25 bps:    {exc['entries_above_limit']}")
-
-    ext = exc["exit_slippage"]
-    print("\n[ EXIT SLIPPAGE BREAKDOWN ]")
-    print(f"  Exit Fill Count:     {ext['count']}")
-    print(f"  Exit Avg Slippage:   {ext['avg']:.2f} bps")
-    print(f"  Exit P50 Slippage:   {ext['p50']:.2f} bps")
-    print(f"  Exit P95 Slippage:   {ext['p95']:.2f} bps")
-    print(f"  Exit Max Slippage:   {ext['max']:.2f} bps")
-    print(f"  Largest Slip Fill:   {exc['largest_slippage_bps']:.2f} bps ({exc['largest_slippage_symbol']}, Order: {exc['largest_slippage_order']})")
-
-    trd = res["trading"]
     print("\n[ TRADING ]")
-    print(f"  Total Closed Trades: {trd['trades']}")
-    print(f"  Winning Trades:      {trd['wins']}")
-    print(f"  Losing Trades:       {trd['losses']}")
-    print(f"  Win Rate:            {trd['win_rate']:.2f}%")
-    print(f"  Profit Factor:       {trd['profit_factor']:.2f}")
-    print(f"  Expectancy:          ${trd['expectancy']:.4f}")
-    print(f"  Average Win:         ${trd['avg_win']:.2f}")
-    print(f"  Average Loss:        ${trd['avg_loss']:.2f}")
+    print(
+        f"  Trades / wins / losses:{trading['trade_count']:>8} / "
+        f"{trading['wins']} / {trading['losses']}"
+    )
+    print(f"  Win rate:              {trading['win_rate_pct']:.2f}%")
+    pf = trading["profit_factor"]
+    print(f"  Profit factor:         {'N/A (no gross loss)' if pf is None else f'{pf:.4f}'}")
+    print(f"  Average win / loss:    {_money(trading['average_win'])} / {_money(trading['average_loss'])}")
+    print(f"  Largest win / loss:    {_money(trading['largest_win'])} / {_money(trading['largest_loss'])}")
+    print(f"  Avg / median hold:     {trading['average_holding_seconds']:.2f}s / {trading['median_holding_seconds']:.2f}s")
+    print(f"  Exit reasons:          {trading['exit_reason_distribution']}")
+    print(f"  Trades per symbol:     {trading['trades_per_symbol']}")
 
-    exits = res["exit_reasons"]
-    hs = exits["hard_stops"]
-    print("\n[ EXIT REASONS ]")
-    print(f"  Hard Stops:          {hs['count']} (PnL: ${hs['pnl']:,.2f}, Max Effective Stop: {hs['max_effective_stop_pct']:.2f}%)")
-    te = exits["trailing_exits"]
-    print(f"  Trailing Exits:      {te['count']} (PnL: ${te['pnl']:,.2f})")
-    ne = exits["normal_exits"]
-    print(f"  Normal Exits:        {ne['count']} (PnL: ${ne['pnl']:,.2f})")
+    print("\n[ ENTRY / CHURN PROTECTION ]")
+    print(f"  Rejected entries:      {protection['rejected_entries']}")
+    print(f"  Cooldown rejects:      {protection['rejected_cooldown']}")
+    print(f"  Duplicate/stale:       {protection['rejected_duplicate_or_stale_signal']}")
+    print(f"  Insufficient edge:     {protection['rejected_insufficient_expected_edge']}")
+    print(f"  Re-entry prevented:    {protection['reentry_attempts_prevented']}")
+    print(f"  Consecutive-loss events:{protection['consecutive_loss_events']:>7}")
 
-    syms = res["symbols"]
-    print("\n[ SYMBOLS ]")
-    print(f"  Largest Symbol Loss: ${syms['largest_single_symbol_loss']:,.2f} ({syms['worst_symbol']})")
-    if syms["worst_symbols"]:
-        print("  Worst Symbols:")
-        for ws in syms["worst_symbols"]:
-            print(f"    - {ws['symbol']}: PnL=${ws['pnl']:,.2f}, Trades={ws['trades']}, Stopouts={ws['stopouts']}")
-    if syms["best_symbols"]:
-        print("  Best Symbols:")
-        for bs in syms["best_symbols"]:
-            print(f"    - {bs['symbol']}: PnL=${bs['pnl']:,.2f}, Trades={bs['trades']}, Stopouts={bs['stopouts']}")
+    print("\n[ EXECUTION ]")
+    print(f"  Orders / fills:        {execution['orders']} / {execution['fills']}")
+    print(f"  Partial / nonterminal: {execution['partial_orders']} / {execution['nonterminal_orders']}")
+    print(
+        "  Slippage bps avg/max: "
+        f"{execution['all_slippage_bps']['avg']:.4f} / "
+        f"{execution['all_slippage_bps']['max']:.4f}"
+    )
 
-    strats = res["strategies"]
-    print("\n[ STRATEGIES ]")
-    for sid, sv in strats.items():
-        print(f"  - {sid}: Trades={sv['trades']}, WinRate={sv['win_rate']}%, PnL=${sv['net_pnl']:,.2f}, Expectancy=${sv['expectancy']:.4f}")
+    print("\n[ RUNTIME HEALTH ]")
+    print(f"  Exceptions:            {health['exceptions']}")
+    print(f"  Persistence errors:    {health['persistence_errors']}")
+    print(f"  Stale-feed violation:  {health['stale_feed_violation']}")
+    print(f"  Stale-market rejects:  {health['stale_market_rejections']}")
+    print(f"  Risk rejects:          {health['risk_rejections']}")
+    print(
+        f"  Signals / opportunities:{health['signals_generated']:>6} / "
+        f"{health['opportunities_evaluated']}"
+    )
 
-    risk = res["risk"]
-    print("\n[ RISK ]")
-    print(f"  Circuit Breaker:     {'TRIPPED' if risk['circuit_breaker_active'] else 'NORMAL'}")
+    print("\n[ ACCOUNTING / INTEGRITY ]")
+    print(f"  Cash reconciliation:  diff={_money(integrity['cash_vs_expected_diff'])}")
+    print(f"  Realized reconciliation: diff={_money(integrity['realized_vs_closed_trade_diff'])}")
+    print(f"  Fee reconciliation:   diff={_money(integrity['account_fees_vs_fill_fees_diff'])}")
+    print(f"  Trade formula errors: {integrity['trade_reconciliation_errors']}")
+    print(f"  Duplicate trades/fills:{integrity['duplicate_trades']} / {integrity['duplicate_fills']}")
+    print(f"  Unmatched fills:       {integrity['unmatched_fills']}")
+    print(f"  Orphan trails:         {integrity['orphan_trails']}")
+    print(
+        "  ACCOUNTING STATUS:    "
+        + ("PASS" if integrity["accounting_invariants_pass"] else "FAIL")
+    )
+    print("=" * 78)
 
-    integ = res["integrity"]
-    print("\n[ INTEGRITY & RECONCILIATION ]")
-    print(f"  Orphan Trails:       {integ['orphan_trails']} {'(PASS)' if integ['orphan_trails'] == 0 else '(FAIL)'}")
-    print(f"  Duplicate Trades:    {integ['duplicate_trades']} {'(PASS)' if integ['duplicate_trades'] == 0 else '(FAIL)'}")
-    print(f"  Duplicate Fills:     {integ['duplicate_fills']} {'(PASS)' if integ['duplicate_fills'] == 0 else '(FAIL)'}")
-    print(f"  Unmatched Fills:     {integ['unmatched_fills']} {'(PASS)' if integ['unmatched_fills'] == 0 else '(FAIL)'}")
-    print(f"  Nonterminal Orders:  {integ['nonterminal_partial_orders']} {'(PASS)' if integ['nonterminal_partial_orders'] == 0 else '(FAIL)'}")
-    print(f"  Accounting Match:    {'PASS (Diff=$' + str(integ['cash_vs_expected_diff']) + ')' if not integ['accounting_mismatch'] else 'FAIL'}")
 
-    print("=" * 70)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Analyze Paper Trading SQLite Database")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Analyze a paper-trading SQLite database")
     parser.add_argument("db_path", help="Path to SQLite database file")
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of the text report")
     args = parser.parse_args()
-
-    results = analyze_database(args.db_path)
-    print_report(results)
+    try:
+        results = analyze_database(args.db_path)
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        print_report(results)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,24 @@ opportunity:
   min_fill_probability: 0.5
   max_correlation: 0.7
 
+# --- Paper execution / re-entry / churn protection ---
+# Environment variables shown in comments override these model defaults.
+paper:
+  loss_cooldown_seconds: 300.0             # LOSS_COOLDOWN_SECONDS; each net loss
+  win_cooldown_seconds: 30.0               # WIN_COOLDOWN_SECONDS; shorter than loss
+  trail_activation_pct: 0.20               # TRAIL_ACTIVATION_PCT; configured floor
+  trail_distance_pct: 0.20                 # TRAIL_DISTANCE_PCT
+  # Runtime activation is raised above the floor when required so the trail
+  # level covers estimated fees/spread/slippage instead of protecting a net loss.
+  max_consecutive_losses_per_symbol: 2     # MAX_CONSECUTIVE_LOSSES_PER_SYMBOL
+  symbol_lockout_seconds: 1800.0            # SYMBOL_LOCKOUT_SECONDS; temporary
+  symbol_loss_streak_reset_seconds: 21600.0 # SYMBOL_LOSS_STREAK_RESET_SECONDS
+  min_expected_edge_over_cost: 0.001        # MIN_EXPECTED_EDGE_OVER_COST (10 bps)
+  taker_fee: 0.001                          # PAPER_TAKER_FEE (0.10% each fill)
+  maker_fee: 0.001                          # PAPER_MAKER_FEE
+  slippage_bps: 5.0                        # PAPER_SLIPPAGE_BPS each fill
+  simulated_latency_ms: 50.0               # PAPER_SIMULATED_LATENCY_MS
+
 # --- Execution ---
 execution:
   max_retries: 3

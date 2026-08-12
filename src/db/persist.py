@@ -8,6 +8,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 from src.core.logging_config import get_logger
 
@@ -22,7 +23,10 @@ CREATE TABLE IF NOT EXISTS paper_risk(id INTEGER PRIMARY KEY CHECK(id=1),total_e
 CREATE TABLE IF NOT EXISTS paper_session(session_id TEXT PRIMARY KEY,commit_sha TEXT,started_at TEXT,ended_at TEXT,status TEXT DEFAULT 'STARTING');
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event_type TEXT,details TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS runtime_lease(account_id TEXT PRIMARY KEY,owner_id TEXT,acquired_at TEXT,heartbeat_at TEXT,expires_at TEXT);
-CREATE TABLE IF NOT EXISTS paper_closed_trades(trade_id TEXT PRIMARY KEY,symbol TEXT,direction TEXT,entry_price REAL,exit_price REAL,quantity REAL,gross_pnl REAL,fees REAL,slippage_cost REAL,net_pnl REAL,return_pct REAL,exit_reason TEXT,strategy_id TEXT DEFAULT '',entry_time TEXT,exit_time TEXT,created_at TEXT);"""
+CREATE TABLE IF NOT EXISTS paper_closed_trades(trade_id TEXT PRIMARY KEY,symbol TEXT,direction TEXT,entry_price REAL,exit_price REAL,quantity REAL,gross_pnl REAL,fees REAL,slippage_cost REAL,net_pnl REAL,return_pct REAL,exit_reason TEXT,strategy_id TEXT DEFAULT '',entry_time TEXT,exit_time TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_symbol_risk(symbol TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_signal_state(signal_key TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_runtime_metrics(metric_name TEXT PRIMARY KEY,metric_value REAL NOT NULL DEFAULT 0,updated_at TEXT);"""
 
 
 class PaperPersistence:
@@ -35,6 +39,7 @@ class PaperPersistence:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
         logger.info("persist_connected", path=self.db_path)
 
@@ -42,6 +47,54 @@ class PaperPersistence:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    def _migrate_schema(self) -> None:
+        """Apply additive SQLite migrations without invalidating old soak DBs."""
+        if not self._conn:
+            return
+        additions: dict[str, dict[str, str]] = {
+            "paper_account": {
+                "unrealized_pnl": "REAL DEFAULT 0",
+                "equity": "REAL DEFAULT 0",
+            },
+            "paper_positions": {
+                "entry_reference_price": "REAL DEFAULT 0",
+                "entry_slippage_cost": "REAL DEFAULT 0",
+                "trail_activation_pct": "REAL DEFAULT 0",
+                "current_price": "REAL DEFAULT 0",
+                "unrealized_pnl": "REAL DEFAULT 0",
+                "signal_id": "TEXT DEFAULT ''",
+                "signal_timestamp": "TEXT",
+                "entry_confidence": "REAL",
+                "mfe_pct": "REAL DEFAULT 0",
+                "mae_pct": "REAL DEFAULT 0",
+                "metadata_json": "TEXT DEFAULT '{}'",
+            },
+            "paper_trail": {
+                "activation_price": "REAL DEFAULT 0",
+                "activation_pct": "REAL DEFAULT 0",
+            },
+            "paper_closed_trades": {
+                "entry_fee": "REAL DEFAULT 0",
+                "exit_fee": "REAL DEFAULT 0",
+                "holding_seconds": "REAL DEFAULT 0",
+                "signal_id": "TEXT DEFAULT ''",
+                "signal_timestamp": "TEXT",
+                "entry_confidence": "REAL",
+                "mfe_pct": "REAL DEFAULT 0",
+                "mae_pct": "REAL DEFAULT 0",
+            },
+        }
+        for table, columns in additions.items():
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column, definition in columns.items():
+                if column not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    )
 
     def _ensure_lease_table(self) -> None:
         """Ensure the runtime_lease table exists (called by orchestrator)."""
@@ -69,11 +122,13 @@ class PaperPersistence:
     def save_account(self, s: dict) -> None:
         with self._tx() as c:
             c.execute(
-                "INSERT OR REPLACE INTO paper_account(id,initial_balance,cash,allocated,realized_pnl,total_fees,total_slippage,trade_count,win_count,loss_count,peak_equity,max_drawdown_pct,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO paper_account(id,initial_balance,cash,allocated,unrealized_pnl,equity,realized_pnl,total_fees,total_slippage,trade_count,win_count,loss_count,peak_equity,max_drawdown_pct,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     s.get("initial_balance", 10000),
                     s.get("cash", 10000),
                     s.get("allocated", 0),
+                    s.get("unrealized_pnl", 0),
+                    s.get("equity", s.get("cash", 10000) + s.get("allocated", 0)),
                     s.get("realized_pnl", 0),
                     s.get("total_fees", 0),
                     s.get("total_slippage", 0),
@@ -96,18 +151,29 @@ class PaperPersistence:
     def save_position(self, p: dict) -> None:
         with self._tx() as c:
             c.execute(
-                "INSERT OR REPLACE INTO paper_positions(position_id,symbol,direction,quantity,entry_price,entry_notional,cost_basis,entry_fee,stop_loss_price,strategy_id,is_open,opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO paper_positions(position_id,symbol,direction,quantity,entry_price,entry_reference_price,entry_notional,cost_basis,entry_fee,entry_slippage_cost,stop_loss_price,trail_activation_pct,current_price,unrealized_pnl,strategy_id,signal_id,signal_timestamp,entry_confidence,mfe_pct,mae_pct,metadata_json,is_open,opened_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     p["position_id"],
                     p["symbol"],
                     p.get("direction", "long"),
                     p["quantity"],
                     p["entry_price"],
+                    p.get("entry_reference_price", p["entry_price"]),
                     p.get("entry_notional", 0),
                     p.get("cost_basis", 0),
                     p.get("entry_fee", 0),
+                    p.get("entry_slippage_cost", 0),
                     p.get("stop_loss_price"),
+                    p.get("trail_activation_pct", 0),
+                    p.get("current_price", 0),
+                    p.get("unrealized_pnl", 0),
                     p.get("strategy_id", ""),
+                    p.get("signal_id", ""),
+                    p.get("signal_timestamp"),
+                    p.get("entry_confidence"),
+                    p.get("mfe_pct", 0),
+                    p.get("mae_pct", 0),
+                    json.dumps(p.get("metadata", {})),
                     1,
                     p.get("opened_at", self._now()),
                     self._now(),
@@ -150,11 +216,13 @@ class PaperPersistence:
     def save_trail(self, pid: str, t: dict) -> None:
         with self._tx() as c:
             c.execute(
-                "INSERT OR REPLACE INTO paper_trail(position_id,trail_peak,trail_level,trail_activated,exit_intent_active,updated_at) VALUES(?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO paper_trail(position_id,trail_peak,trail_level,activation_price,activation_pct,trail_activated,exit_intent_active,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     pid,
                     t.get("trail_peak", 0),
                     t.get("trail_level", 0),
+                    t.get("activation_price", 0),
+                    t.get("activation_pct", 0),
                     1 if t.get("trail_activated") else 0,
                     1 if t.get("exit_intent_active") else 0,
                     self._now(),
@@ -282,7 +350,7 @@ class PaperPersistence:
     def save_closed_trade(self, t: dict) -> None:
         with self._tx() as c:
             c.execute(
-                "INSERT OR REPLACE INTO paper_closed_trades(trade_id,symbol,direction,entry_price,exit_price,quantity,gross_pnl,fees,slippage_cost,net_pnl,return_pct,exit_reason,strategy_id,entry_time,exit_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO paper_closed_trades(trade_id,symbol,direction,entry_price,exit_price,quantity,gross_pnl,fees,entry_fee,exit_fee,slippage_cost,net_pnl,return_pct,exit_reason,strategy_id,entry_time,exit_time,holding_seconds,signal_id,signal_timestamp,entry_confidence,mfe_pct,mae_pct,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     t["trade_id"],
                     t["symbol"],
@@ -291,7 +359,9 @@ class PaperPersistence:
                     t["exit_price"],
                     t["quantity"],
                     t.get("gross_pnl", 0),
-                    t.get("fees", 0),
+                    t.get("fees", t.get("entry_fee", 0) + t.get("exit_fee", 0)),
+                    t.get("entry_fee", 0),
+                    t.get("exit_fee", 0),
                     t.get("slippage_cost", 0),
                     t.get("net_pnl", 0),
                     t.get("return_pct", 0),
@@ -299,6 +369,12 @@ class PaperPersistence:
                     t.get("strategy_id", ""),
                     t.get("entry_time", self._now()),
                     t.get("exit_time", self._now()),
+                    t.get("holding_seconds", 0),
+                    t.get("signal_id", ""),
+                    t.get("signal_timestamp"),
+                    t.get("entry_confidence"),
+                    t.get("mfe_pct", 0),
+                    t.get("mae_pct", 0),
                     self._now(),
                 ),
             )
@@ -360,3 +436,60 @@ class PaperPersistence:
             ).fetchone()
             is not None
         )
+
+    # SYMBOL RISK / SIGNAL FRESHNESS / RUNTIME TELEMETRY
+    def save_symbol_risk_state(self, state: dict[str, Any]) -> None:
+        with self._tx() as c:
+            for symbol, value in state.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO paper_symbol_risk(symbol,state_json,updated_at) VALUES(?,?,?)",
+                    (symbol, json.dumps(value), self._now()),
+                )
+
+    def load_symbol_risk_state(self) -> dict[str, Any]:
+        if not self._conn:
+            return {}
+        result: dict[str, Any] = {}
+        for row in self._conn.execute("SELECT symbol,state_json FROM paper_symbol_risk"):
+            try:
+                result[str(row["symbol"])] = json.loads(row["state_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return result
+
+    def save_signal_state(self, state: dict[str, Any]) -> None:
+        with self._tx() as c:
+            for signal_key, value in state.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO paper_signal_state(signal_key,state_json,updated_at) VALUES(?,?,?)",
+                    (signal_key, json.dumps(value), self._now()),
+                )
+
+    def load_signal_state(self) -> dict[str, Any]:
+        if not self._conn:
+            return {}
+        result: dict[str, Any] = {}
+        for row in self._conn.execute("SELECT signal_key,state_json FROM paper_signal_state"):
+            try:
+                result[str(row["signal_key"])] = json.loads(row["state_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return result
+
+    def save_runtime_metrics(self, metrics: dict[str, float | int]) -> None:
+        with self._tx() as c:
+            for name, value in metrics.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO paper_runtime_metrics(metric_name,metric_value,updated_at) VALUES(?,?,?)",
+                    (name, float(value), self._now()),
+                )
+
+    def load_runtime_metrics(self) -> dict[str, float]:
+        if not self._conn:
+            return {}
+        return {
+            str(row["metric_name"]): float(row["metric_value"])
+            for row in self._conn.execute(
+                "SELECT metric_name,metric_value FROM paper_runtime_metrics"
+            )
+        }

@@ -102,6 +102,7 @@ class RejectionReason(str, PyEnum):
     STALE_DATA = "stale_data"
     EXPIRED_SIGNAL = "expired_signal"
     STRATEGY_DISABLED = "strategy_disabled"
+    INSUFFICIENT_EXPECTED_EDGE = "insufficient_expected_edge"
     EXCHANGE_ERROR = "exchange_error"
     OTHER = "other"
 
