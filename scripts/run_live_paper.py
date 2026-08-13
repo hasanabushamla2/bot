@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""R26: LIVE PAPER TRADING — Dynamic max-liquidity KuCoin universe scanner.
+"""LIVE PAPER TRADING — feed-budget-aware KuCoin liquid-universe scanner.
 
-Connects to KuCoin, fetches ALL liquid USDT pairs, feeds them through
-the existing orchestrator. Batched REST polling cycles through all symbols.
-ALL orders are PAPER ONLY.
+Connects to KuCoin, ranks current liquid USDT pairs, and feeds a bounded fresh
+book universe through the existing orchestrator. ALL orders are PAPER ONLY.
 """
 
 from __future__ import annotations
@@ -21,6 +20,13 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 SYMBOL_STATS: dict[str, dict] = {}
+
+# Feed-budget defaults: 25 books every 3s means 100 symbols receive a full
+# order-book refresh in about 12 seconds, well inside the 45-second stale-data
+# protection.  This is not a desired trades/hour setting.
+DEFAULT_MAX_SYMBOLS = 100
+DEFAULT_MIN_VOLUME_USD = 100_000.0
+DEFAULT_MAX_SPREAD_BPS = 35.0
 
 
 def _kucoin_safety_proof() -> None:
@@ -239,7 +245,31 @@ async def main() -> None:
         help="Delete only the selected paper DB (plus WAL/SHM) before starting",
     )
     parser.add_argument("--activity-test", action="store_true")
+    parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=DEFAULT_MAX_SYMBOLS,
+        help="Maximum live-liquid symbols in the automatic universe; sized for book freshness.",
+    )
+    parser.add_argument(
+        "--min-volume-usd",
+        type=float,
+        default=DEFAULT_MIN_VOLUME_USD,
+        help="Minimum current 24h quote volume for automatic-universe candidates.",
+    )
+    parser.add_argument(
+        "--max-spread-bps",
+        type=float,
+        default=DEFAULT_MAX_SPREAD_BPS,
+        help="Maximum current top-of-book spread for automatic-universe candidates.",
+    )
     args = parser.parse_args()
+    if args.max_symbols <= 0:
+        parser.error("--max-symbols must be positive")
+    if args.min_volume_usd < 0:
+        parser.error("--min-volume-usd must be non-negative")
+    if args.max_spread_bps <= 0:
+        parser.error("--max-spread-bps must be positive")
 
     if os.environ.get("LIVE_TRADING_ENABLED", "false").lower() in ("true", "1", "yes"):
         print("SAFETY GATE: LIVE_TRADING_ENABLED=true — REFUSING TO START")
@@ -267,9 +297,27 @@ async def main() -> None:
             await adapter.disconnect()
             return
 
-        symbols = adapter.filter_liquid_usdt_pairs(all_syms)
+        all_tickers = await adapter.get_all_tickers()
+        if not all_tickers:
+            print("ERROR: No current ticker universe returned")
+            await adapter.disconnect()
+            return
+        symbols = adapter.rank_liquid_usdt_pairs(
+            all_syms,
+            all_tickers,
+            min_volume_usd=args.min_volume_usd,
+            max_symbols=args.max_symbols,
+            max_spread_bps=args.max_spread_bps,
+        )
         await adapter.disconnect()
-        print(f"Dynamic universe: {len(all_syms)} total → {len(symbols)} liquid USDT pairs")
+        if not symbols:
+            print("ERROR: No symbols passed current volume/spread liquidity selection")
+            return
+        print(
+            f"Dynamic universe: {len(all_syms)} metadata → {len(symbols)} current-liquid USDT pairs "
+            f"(cap={args.max_symbols}, min volume=${args.min_volume_usd:,.0f}, "
+            f"max spread={args.max_spread_bps:.1f}bps)"
+        )
 
     exp_id = args.experiment_id
 

@@ -109,8 +109,17 @@ Use a clean database and the public-market paper runner. `--fresh-db` removes
 only the selected SQLite database (and its WAL/SHM sidecars) before startup.
 It does not change fees, slippage, sizing, strategy logic, or risk rules.
 
+For an automatic KuCoin universe, the runner ranks current USDT pairs by live
+24-hour quote volume and top-of-book spread, then caps the set to the book-feed
+budget. This avoids scanning thousands of metadata-listed pairs whose books
+cannot be refreshed before stale-data protection fires. It is a market-data
+freshness control, not a target number of trades.
+
 ```powershell
 python .\scripts\run_live_paper.py --duration 3600 --experiment-id full_soak_1h --db-path data/full_soak_1h.db --fresh-db
+
+# Optional automatic-universe controls; these bound feed freshness, not trade count.
+python .\scripts\run_live_paper.py --duration 3600 --max-symbols 100 --min-volume-usd 100000 --max-spread-bps 35 --fresh-db
 ```
 
 Inspect a fact-only snapshot from another PowerShell window:

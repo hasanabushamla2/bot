@@ -173,11 +173,19 @@ class KuCoinPublicAdapter:
     def filter_liquid_usdt_pairs(
         self, symbols: list[dict[str, Any]], min_volume_usd: float = 100_000
     ) -> list[str]:
-        """Filter to liquid USDT pairs. Returns ALL that pass (no arbitrary limit)."""
+        """Return eligible USDT symbols from exchange metadata only.
+
+        Volume is deliberately not claimed here: KuCoin's symbol metadata does
+        not contain a contemporaneous quote-volume field.  Call
+        :meth:`rank_liquid_usdt_pairs` with ``get_all_tickers`` output before
+        running a live feed so the ``min_volume_usd`` contract is actually
+        enforced.
+        """
+        del min_volume_usd  # retained for compatibility with older callers
         result: list[str] = []
         for s in symbols:
-            sym = s.get("symbol", "")
-            base = s.get("baseCurrency", "")
+            sym = str(s.get("symbol", ""))
+            base = str(s.get("baseCurrency", ""))
             if s.get("quoteCurrency") != "USDT":
                 continue
             if not s.get("enableTrading", False):
@@ -187,14 +195,73 @@ class KuCoinPublicAdapter:
             if any(kw in sym for kw in LEVERAGE_KW):
                 continue
             result.append(sym)
-        priority = [s for s in result if s in PRIORITY_SYMBOLS]
-        rest = [s for s in result if s not in PRIORITY_SYMBOLS]
+        priority = [symbol for symbol in result if symbol in PRIORITY_SYMBOLS]
+        rest = [symbol for symbol in result if symbol not in PRIORITY_SYMBOLS]
         filtered = priority + rest
         logger.info(
-            "kucoin_universe", total=len(symbols), usdt=len(result),
-            filtered=len(filtered), priority=len(priority),
+            "kucoin_eligible_usdt_metadata",
+            total=len(symbols),
+            eligible=len(filtered),
+            priority=len(priority),
         )
         return filtered
+
+    def rank_liquid_usdt_pairs(
+        self,
+        symbols: list[dict[str, Any]],
+        tickers: dict[str, dict[str, Any]],
+        *,
+        min_volume_usd: float = 100_000.0,
+        max_symbols: int = 100,
+        max_spread_bps: float = 35.0,
+    ) -> list[str]:
+        """Select a feed-budget-compatible, liquid universe from live data.
+
+        The old runner subscribed to every metadata-eligible pair, but only
+        refreshed 25 books every three seconds.  With thousands of symbols,
+        most books were stale before a full cycle completed.  This selector is
+        intentionally a *market-data capacity* control, not a trade-count
+        target: it keeps a compact, liquid set whose books can be refreshed
+        within the stale-data budget.
+        """
+        if max_symbols <= 0:
+            return []
+        eligible = self.filter_liquid_usdt_pairs(symbols)
+        ranked: list[tuple[int, float, str]] = []
+        for symbol in eligible:
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+            try:
+                volume = float(ticker.get("volume_24h_usd", 0.0))
+                bid = float(ticker.get("bid", 0.0))
+                ask = float(ticker.get("ask", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if volume < min_volume_usd or bid <= 0.0 or ask <= bid:
+                continue
+            mid = (bid + ask) / 2.0
+            spread_bps = (ask - bid) / mid * 10_000.0 if mid > 0 else float("inf")
+            if spread_bps > max_spread_bps:
+                continue
+            # Keep widely traded core symbols represented, then rank the
+            # remainder by current quote volume.  This is deterministic for a
+            # given ticker snapshot and does not use future returns.
+            priority_rank = 0 if symbol in PRIORITY_SYMBOLS else 1
+            ranked.append((priority_rank, -volume, symbol))
+
+        ranked.sort()
+        selected = [symbol for _, _, symbol in ranked[:max_symbols]]
+        logger.info(
+            "kucoin_ranked_liquid_universe",
+            metadata_eligible=len(eligible),
+            ticker_eligible=len(ranked),
+            selected=len(selected),
+            max_symbols=max_symbols,
+            min_volume_usd=min_volume_usd,
+            max_spread_bps=max_spread_bps,
+        )
+        return selected
 
     async def get_server_time(self) -> datetime:
         try:

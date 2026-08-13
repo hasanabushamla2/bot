@@ -1731,12 +1731,22 @@ class PaperTradingOrchestrator:
                 max_trail_distance_pct=self._paper_config.max_trail_distance_pct,
             )
             trail_distance_fraction = trail_params.trail_distance_pct / 100.0
+            # A trailing exit must first cover both modeled round-trip costs
+            # and the same safety margin required at entry.  Previously the
+            # activation formula covered costs only, which allowed a normal
+            # trail retracement to report a net-loss ``trail_hit`` after fees
+            # and adverse exit slippage.
+            protected_margin_fraction = (
+                actual_cost_estimate.estimated_round_trip_cost_fraction
+                + self._paper_config.min_expected_edge_over_cost
+            )
+            trail_net_protection_price = fill_price * (1.0 + protected_margin_fraction)
             fee_aware_activation_pct = trail_params.activation_pct
             if trail_distance_fraction < 1.0:
                 fee_aware_activation_pct = max(
                     fee_aware_activation_pct,
                     (
-                        (1.0 + actual_cost_estimate.estimated_round_trip_cost_fraction)
+                        (1.0 + protected_margin_fraction)
                         / (1.0 - trail_distance_fraction)
                         - 1.0
                     )
@@ -1782,6 +1792,8 @@ class PaperTradingOrchestrator:
                     "signal_sequence": signal_sequence,
                     "effective_trail_distance_pct": trail_params.trail_distance_pct,
                     "effective_trail_activation_pct": fee_aware_activation_pct,
+                    "trail_net_protection_price": trail_net_protection_price,
+                    "trail_protected_margin_fraction": protected_margin_fraction,
                     "trail_volatility_component_pct": trail_params.volatility_component_pct,
                     "trail_spread_component_pct": trail_params.spread_component_pct,
                     "strategy_allocation_multiplier": allocation_multiplier,

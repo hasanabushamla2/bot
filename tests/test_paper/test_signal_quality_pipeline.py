@@ -7,8 +7,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from src.features.engine import InstrumentFeatures
-from src.paper.account import ClosedTrade
+from src.paper.account import ClosedTrade, PaperAccount
 from src.paper.engine import PaperExecutionEngine
+from src.paper.position_monitor import PositionMonitor
 from src.paper.reporting import exit_analysis
 from src.paper.telemetry import SignalFunnelTelemetry
 from src.risk.entry_quality import EntryQualityGate
@@ -222,6 +223,40 @@ def test_hard_stop_mfe_mae_and_hold_time_are_classified_for_diagnostics() -> Non
     diagnostics = exit_analysis(trades)["hard_stop"]["entry_classification"]
     assert diagnostics["short_lived_no_favorable_excursion"] == 1
     assert diagnostics["limited_follow_through"] == 1
+
+
+def test_trailing_level_respects_net_cost_protection_floor() -> None:
+    account = PaperAccount(10_000.0)
+    position = account.open_position(
+        "AAA-USDT",
+        "long",
+        100.0,
+        1.0,
+        trail_activation_pct=0.50,
+        metadata={
+            "effective_trail_distance_pct": 0.20,
+            "trail_net_protection_price": 100.50,
+        },
+    )
+    assert position is not None
+    monitor = PositionMonitor(
+        account,
+        trail_config=TrailConfig(trail_pct=0.20, activation_pct=0.20, trailing_delta=0.002),
+    )
+    monitor.register_position(position)
+
+    # The ordinary 0.20% trail from a 100.60 peak would be 100.3988.  The
+    # net-cost floor must ratchet it to 100.50 instead.
+    position.current_price = 100.60
+    assert monitor.check_position(position) is None
+    assert position.trail_level == pytest.approx(100.50)
+
+    # A gap through the floor must exit for safety, but must be classified as
+    # a protection breach rather than a supposedly profitable trail hit.
+    position.current_price = 100.40
+    exit_request = monitor.check_position(position)
+    assert exit_request is not None
+    assert exit_request["reason"] == "trail_protection_breach"
 
 
 def test_volatility_aware_trail_widens_without_creating_a_take_profit_ceiling() -> None:

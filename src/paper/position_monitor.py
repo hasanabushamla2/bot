@@ -98,19 +98,48 @@ class PositionMonitor:
             )
             self._trail_states[sym] = ts
         self.trail_manager.update(ts, price)
+        # The trailing level may never be less protective than the entry-time
+        # net-cost floor.  The floor is computed from the actual paper fill,
+        # expected exit costs, and the configured safety margin; it is not a
+        # fixed take-profit.
+        net_protection_price = self._net_protection_price(pos)
+        if ts.activated and net_protection_price > 0:
+            if pos.direction == "long":
+                ts.trail_level = max(ts.trail_level, net_protection_price)
+            else:
+                ts.trail_level = min(ts.trail_level, net_protection_price)
         pos.trail_peak = ts.peak_price
         pos.trail_activated = ts.activated
         pos.trail_level = ts.trail_level
         if self.trail_manager.should_exit(ts):
             self._exit_intents.add(sym)
+            protection_breached = (
+                net_protection_price > 0
+                and (
+                    (pos.direction == "long" and price < net_protection_price)
+                    or (pos.direction == "short" and price > net_protection_price)
+                )
+            )
             return {
                 "symbol": sym,
-                "reason": "trail_hit",
+                # A price gap through the protection floor is still exited for
+                # risk safety, but is not mislabeled as a profitable trail.
+                "reason": "trail_protection_breach" if protection_breached else "trail_hit",
                 "price": price,
                 "trail_peak": ts.peak_price,
                 "trail_level": ts.trail_level,
             }
         return None
+
+    @staticmethod
+    def _net_protection_price(pos: PaperPosition) -> float:
+        """Return a conservative per-position net-cost floor, if present."""
+        raw = pos.metadata.get("trail_net_protection_price", 0.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if value > 0.0 else 0.0
 
     def check_all(self) -> list[dict[str, Any]]:
         exits: list[dict[str, Any]] = []
