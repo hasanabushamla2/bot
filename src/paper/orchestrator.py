@@ -26,7 +26,7 @@ import uuid
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 def _get_memory_mb() -> float:
@@ -61,6 +61,8 @@ from src.opportunity.engine import OpportunityEngine
 from src.paper.account import CLOSED_TRADE_RAM_LIMIT, ClosedTrade, PaperAccount, PaperPosition
 from src.paper.engine import PaperExecutionEngine
 from src.paper.position_monitor import PositionMonitor
+from src.paper.reporting import exit_analysis, finite_report_value, grouped_trade_metrics, trade_metrics
+from src.paper.telemetry import SignalFunnelTelemetry
 from src.portfolio.allocator import AllocatorConfig, CapitalAllocator, PortfolioState
 from src.portfolio.capacity import PositionCapacity
 from src.portfolio.capital_tiers import CapitalTierConfig, CapitalTierManager
@@ -69,14 +71,15 @@ from src.portfolio.markets import AssetQualityFilter, QualityFilterConfig
 from src.portfolio.universe import UniverseConfig, UniverseManager
 from src.risk.engine import RiskEngine
 from src.risk.entry_guard import EntrySignalGuard
+from src.risk.entry_quality import EntryQualityGate
 from src.risk.strategy_risk import StrategyRiskConfig, StrategyRiskManager
-from src.risk.symbol_risk import SymbolRiskConfig, SymbolRiskManager
+from src.risk.symbol_risk import ReentryContext, SymbolRiskConfig, SymbolRiskManager
 from src.scanner.global_scanner import AssetClass, AssetSnapshot, GlobalScanner
 from src.strategies.breakout_strategy import BreakoutStrategy
 from src.strategies.momentum_strategy import MomentumStrategy
 from src.strategies.order_flow_strategy import OrderFlowStrategy
 from src.strategies.registry import StrategyRegistry
-from src.strategies.trailing_stop import TrailConfig
+from src.strategies.trailing_stop import TrailConfig, compute_volatility_aware_trail
 
 logger = get_logger(__name__)
 
@@ -209,6 +212,8 @@ class PaperTradingOrchestrator:
         self.monitor = PositionMonitor(self.account, trail_config=trail_config)
         self.analytics = AnalyticsTracker()
         self.signal_guard = EntrySignalGuard()
+        self.entry_quality = EntryQualityGate()
+        self.funnel = SignalFunnelTelemetry()
 
         # Engineering Defect Fix Components
         self.liquidity_gate = LiquidityGate(LiquidityGateConfig())
@@ -228,6 +233,15 @@ class PaperTradingOrchestrator:
                 ),
                 symbol_lockout_seconds=self._paper_config.symbol_lockout_seconds,
                 loss_streak_reset_seconds=self._paper_config.symbol_loss_streak_reset_seconds,
+                material_confidence_improvement=(
+                    self._paper_config.material_reentry_confidence_improvement
+                ),
+                base_market_structure_score=(
+                    self._paper_config.min_reentry_market_structure_score
+                ),
+                reference_volatility_pct=(
+                    self._paper_config.reentry_reference_volatility_pct
+                ),
             )
         )
         self.strategy_risk = StrategyRiskManager(StrategyRiskConfig())
@@ -506,6 +520,10 @@ class PaperTradingOrchestrator:
                     "activation_pct": trail.get(
                         "activation_pct", pos.trail_activation_pct
                     ),
+                    "trail_distance_pct": trail.get(
+                        "trail_distance_pct",
+                        pos.metadata.get("effective_trail_distance_pct", 0.0),
+                    ),
                     "activated": bool(trail.get("trail_activated")),
                     "exit_intent": bool(trail.get("exit_intent_active")),
                 })
@@ -531,18 +549,41 @@ class PaperTradingOrchestrator:
         signal_state = self._persist.load_signal_state()
         if signal_state:
             self.signal_guard.restore_state(signal_state)
+        strategy_state = self._persist.load_strategy_risk_state()
+        if strategy_state:
+            self.strategy_risk.restore_state(strategy_state)
+        funnel_state = self._persist.load_telemetry_state("signal_funnel")
+        if funnel_state:
+            self.funnel.restore(funnel_state)
+
         runtime_metrics = self._persist.load_runtime_metrics()
-        self._rejected_entries = int(runtime_metrics.get("rejected_entries", 0))
-        self._symbol_cooldown_rejections = int(
-            runtime_metrics.get("cooldown_rejections", 0)
-        )
+        # Old databases predate the durable funnel JSON.  Seed the stable
+        # counters from their legacy metrics once rather than discarding prior
+        # paper telemetry on upgrade.
+        if not funnel_state:
+            self.funnel.increment("raw_signals", int(runtime_metrics.get("signals_generated", 0)))
+            self.funnel.increment(
+                "opportunities_created", int(runtime_metrics.get("opportunities_evaluated", 0))
+            )
+            self.funnel.increment(
+                "expected_edge_rejections", int(runtime_metrics.get("expected_edge_rejections", 0))
+            )
+            self.funnel.increment(
+                "cooldown_rejections", int(runtime_metrics.get("cooldown_rejections", 0))
+            )
+            self.funnel.increment(
+                "stale_market_rejections", int(runtime_metrics.get("stale_market_rejections", 0))
+            )
+            self.funnel.increment("risk_rejections", int(runtime_metrics.get("risk_rejections", 0)))
+            self.funnel.entry_rejections = int(runtime_metrics.get("rejected_entries", 0))
+
+        self._rejected_entries = self.funnel.entry_rejections
+        self._symbol_cooldown_rejections = self.funnel.counters["cooldown_rejections"]
         self._duplicate_signal_rejections = int(
             runtime_metrics.get("duplicate_signal_rejections", 0)
         )
-        self._expected_edge_rejections = int(
-            runtime_metrics.get("expected_edge_rejections", 0)
-        )
-        self._reentry_rejections = int(runtime_metrics.get("reentry_attempts_prevented", 0))
+        self._expected_edge_rejections = self.funnel.counters["expected_edge_rejections"]
+        self._reentry_rejections = self.funnel.counters["reentry_rejections"]
         self.symbol_risk.consecutive_loss_events_count = int(
             runtime_metrics.get("consecutive_loss_events", 0)
         )
@@ -553,18 +594,10 @@ class PaperTradingOrchestrator:
         self._stale_feed_violation = bool(
             runtime_metrics.get("stale_feed_violation", self._stale_feed_violation)
         )
-        self._stale_market_rejections = int(
-            runtime_metrics.get("stale_market_rejections", self._stale_market_rejections)
-        )
-        self._risk_rejected = int(
-            runtime_metrics.get("risk_rejections", self._risk_rejected)
-        )
-        self._total_signals = int(
-            runtime_metrics.get("signals_generated", self._total_signals)
-        )
-        self._total_opportunities = int(
-            runtime_metrics.get("opportunities_evaluated", self._total_opportunities)
-        )
+        self._stale_market_rejections = self.funnel.counters["stale_market_rejections"]
+        self._risk_rejected = self.funnel.counters["risk_rejections"]
+        self._total_signals = self.funnel.counters["raw_signals"]
+        self._total_opportunities = self.funnel.counters["opportunities_created"]
 
         self.account.state.unrealized_pnl = sum(
             p.unrealized_pnl for p in self.account.state.open_positions.values()
@@ -713,6 +746,10 @@ class PaperTradingOrchestrator:
                         "trail_peak": ts["peak_price"], "trail_level": ts["trail_level"],
                         "activation_price": ts["activation_price"],
                         "activation_pct": ts["activation_pct"],
+                        # Per-position distance is also in the durable position
+                        # metadata; this field makes the trail snapshot itself
+                        # inspectable for a running session.
+                        "trail_distance_pct": ts.get("trail_distance_pct", 0.0),
                         "trail_activated": ts["activated"], "exit_intent_active": ts["exit_intent"],
                     })
                     self._persistence_writes += 1
@@ -790,22 +827,32 @@ class PaperTradingOrchestrator:
         try:
             self._persist.save_symbol_risk_state(self.symbol_risk.get_state())
             self._persist.save_signal_state(self.signal_guard.get_state())
+            self._persist.save_strategy_risk_state(self.strategy_risk.get_state())
+            self._persist.save_telemetry_state("signal_funnel", self.funnel.to_dict())
+            funnel = self.funnel.funnel()
             self._persist.save_runtime_metrics({
-                "rejected_entries": self._rejected_entries,
-                "cooldown_rejections": self._symbol_cooldown_rejections,
+                "rejected_entries": self.funnel.entry_rejections,
+                "cooldown_rejections": funnel["cooldown_rejections"],
                 "duplicate_signal_rejections": self._duplicate_signal_rejections,
-                "expected_edge_rejections": self._expected_edge_rejections,
-                "reentry_attempts_prevented": self._reentry_rejections,
+                "expected_edge_rejections": funnel["expected_edge_rejections"],
+                "reentry_attempts_prevented": (
+                    funnel["cooldown_rejections"] + funnel["reentry_rejections"]
+                ),
+                "reentry_rejections": funnel["reentry_rejections"],
                 "consecutive_loss_events": self.symbol_risk.consecutive_loss_events_count,
+                "early_reentries_allowed": self.symbol_risk.early_reentries_allowed_count,
                 "exceptions": self._exceptions,
                 "persistence_errors": self._persistence_errors,
                 "stale_feed_violation": int(self._stale_feed_violation),
-                "stale_market_rejections": self._stale_market_rejections,
-                "risk_rejections": self._risk_rejected,
-                "signals_generated": self._total_signals,
-                "opportunities_evaluated": self._total_opportunities,
+                "stale_market_rejections": funnel["stale_market_rejections"],
+                "risk_rejections": funnel["risk_rejections"],
+                "signals_generated": funnel["raw_signals"],
+                "opportunities_evaluated": funnel["opportunities_created"],
+                "successful_entries": funnel["successful_entries"],
+                "execution_attempts": funnel["execution_attempts"],
+                **{f"funnel_{name}": value for name, value in funnel.items()},
             })
-            self._persistence_writes += 3
+            self._persistence_writes += 5
         except Exception:
             self._persistence_errors += 1
 
@@ -857,8 +904,16 @@ class PaperTradingOrchestrator:
             return
         self.feed_health.record_message("binance", sym, "ticker", exchange_ts=datetime.now(UTC))
         self.features.update_price(sym, last)
-        self.features.update_order_book(sym, bid, ask)
+        current_features = self.features.get(sym)
+        self.features.update_order_book(
+            sym,
+            bid,
+            ask,
+            current_features.bid_depth_10bps,
+            current_features.ask_depth_10bps,
+        )
         self.features.update_volume(sym, vol)
+        self.allocator.correlation.record_price(sym, last)
         self.account.update_market_price(sym, last)
         self.analytics.record_equity(self.account.state.equity)
 
@@ -885,6 +940,15 @@ class PaperTradingOrchestrator:
         if asks:
             book.asks.apply_snapshot([BookLevel(p, q) for p, q in asks[:50]])
         book.last_update_time = datetime.now(UTC)
+        # Feed live visible-depth imbalance into the feature layer.  The
+        # quality gate treats it as optional confirmation; missing/neutral
+        # depth stays neutral rather than being fabricated as bullish flow.
+        if book.best_bid > 0 and book.best_ask > 0:
+            bid_depth = book.bids.depth_by_levels(5)
+            ask_depth = book.asks.depth_by_levels(5)
+            self.features.update_order_book(
+                canonical, book.best_bid, book.best_ask, bid_depth, ask_depth
+            )
         self._book_events_received += 1
         self.feed_health.record_message("binance", canonical, "book", exchange_ts=datetime.now(UTC))
 
@@ -930,16 +994,79 @@ class PaperTradingOrchestrator:
             ),
         })
 
-    def _record_entry_rejection(self, reason: str) -> None:
-        self._rejected_entries += 1
-        if reason == "cooldown":
-            self._symbol_cooldown_rejections += 1
-            self._reentry_rejections += 1
-        elif reason == "duplicate_signal":
+    def _record_pipeline_rejection(
+        self,
+        reason: str,
+        *,
+        strategy_id: str | None = None,
+        symbol: str | None = None,
+        entry_attempt: bool = False,
+    ) -> None:
+        """Record every filtering path in one structured, non-silent ledger."""
+        self.funnel.reject(
+            reason,
+            strategy_id=strategy_id,
+            symbol=symbol,
+            entry_attempt=entry_attempt,
+        )
+        if strategy_id:
+            self.strategy_risk.record_rejection(strategy_id, reason)
+        # Legacy scalar attributes remain for API/dashboard compatibility.
+        self._rejected_entries = self.funnel.entry_rejections
+        self._symbol_cooldown_rejections = self.funnel.counters["cooldown_rejections"]
+        self._expected_edge_rejections = self.funnel.counters["expected_edge_rejections"]
+        self._stale_market_rejections = self.funnel.counters["stale_market_rejections"]
+        self._liquidity_rejections = self.funnel.counters["liquidity_rejections"]
+        self._spread_rejections = self.funnel.counters["spread_rejections"]
+        self._risk_rejected = self.funnel.counters["risk_rejections"]
+        self._reentry_rejections = self.funnel.counters["reentry_rejections"]
+
+    def _record_entry_rejection(
+        self,
+        reason: str,
+        *,
+        strategy_id: str | None = None,
+        symbol: str | None = None,
+    ) -> None:
+        """Compatibility wrapper for a rejection after an opportunity exists."""
+        mapped = {
+            "duplicate_signal": "reentry",
+            "strategy_risk": "risk",
+            "missing_stop": "risk",
+            "missing_book": "liquidity",
+            "allocation": "capacity",
+            "minimum_notional": "capacity",
+            "participation": "liquidity",
+            "entry_execution": "liquidity",
+            "exit_execution": "liquidity",
+            "entry_fill": "liquidity",
+            "account": "capacity",
+        }.get(reason, reason)
+        if reason == "duplicate_signal":
             self._duplicate_signal_rejections += 1
-            self._reentry_rejections += 1
-        elif reason == "expected_edge":
-            self._expected_edge_rejections += 1
+        self._record_pipeline_rejection(
+            mapped,
+            strategy_id=strategy_id,
+            symbol=symbol,
+            entry_attempt=True,
+        )
+
+    def _record_inactive_signal(self, reason: str, strategy_id: str | None, symbol: str | None) -> None:
+        self.funnel.increment("inactive_signals")
+        self._record_pipeline_rejection(reason, strategy_id=strategy_id, symbol=symbol)
+
+    def _valid_signal(self, signal: Any) -> tuple[bool, str]:
+        if signal is None:
+            return False, "inactive"
+        if not getattr(signal, "symbol", None):
+            return False, "invalid_signal"
+        if getattr(signal, "direction", None) is None or signal.direction.value == "neutral":
+            return False, "inactive"
+        if signal.is_expired:
+            return False, "stale_market"
+        if signal.estimated_return is None:
+            return False, "expected_edge"
+        return True, "valid"
 
     # ══════════════════════════════════════════════════════════════════
     async def _scan_tick(self) -> None:
@@ -1046,6 +1173,7 @@ class PaperTradingOrchestrator:
                 # A partial execution is a realized slice, but re-entry/churn
                 # state changes only after the symbol position is fully closed.
                 if sym not in self.account.state.open_positions:
+                    self.funnel.increment("closed_trades")
                     next_consecutive_losses = (
                         0
                         if lifecycle_net_pnl > 0
@@ -1057,6 +1185,10 @@ class PaperTradingOrchestrator:
                         consecutive_losses=next_consecutive_losses,
                         open_positions_count=len(self.account.state.open_positions),
                     )
+                    try:
+                        signal_sequence = int(pos_data.metadata.get("signal_sequence", 0))
+                    except (TypeError, ValueError):
+                        signal_sequence = 0
                     self.symbol_risk.record_trade_exit(
                         sym,
                         lifecycle_net_pnl,
@@ -1064,10 +1196,27 @@ class PaperTradingOrchestrator:
                         fill.slippage_bps,
                         self.account.state.equity,
                         exit_time=trade.exit_time,
+                        return_pct=trade.return_pct,
+                        direction=trade.direction,
+                        strategy_id=trade.strategy_id,
+                        entry_confidence=trade.entry_confidence,
+                        signal_id=trade.signal_id,
+                        signal_sequence=signal_sequence,
+                        market_volatility_pct=float(
+                            pos_data.metadata.get("entry_volatility_pct", 0.0)
+                        ),
                     )
                 self.strategy_risk.record_trade_exit(
-                    trade.strategy_id, trade.gross_pnl, trade.net_pnl, trade.fees,
-                    trade.slippage_cost, ex["reason"], self.account.state.equity
+                    trade.strategy_id,
+                    trade.gross_pnl,
+                    trade.net_pnl,
+                    trade.fees,
+                    trade.slippage_cost,
+                    ex["reason"],
+                    self.account.state.equity,
+                    mfe_pct=trade.max_favorable_excursion_pct,
+                    mae_pct=trade.max_adverse_excursion_pct,
+                    holding_seconds=trade.holding_seconds,
                 )
 
                 pid = f"pos-{sym}"
@@ -1094,11 +1243,14 @@ class PaperTradingOrchestrator:
         for canonical in self._canonical_symbols:
             feat = self.features.get(canonical)
             if feat.sample_count < 10 or feat.last_price <= 0:
+                self._record_pipeline_rejection("market_warmup", symbol=canonical)
                 continue
 
-            # Check Feed Health
+            # Check Feed Health.  Do not silently turn an unhealthy feed into
+            # a lack of signals; it is a stale-market safety rejection.
             ticker_health = self.feed_health.get("binance", canonical, "ticker")
             if ticker_health and not ticker_health.is_healthy:
+                self._record_pipeline_rejection("stale_market", symbol=canonical)
                 continue
 
             # Cooldown does not suppress signal observation.  Strategies must
@@ -1115,12 +1267,18 @@ class PaperTradingOrchestrator:
                 expected_slippage_bps=feat.spread_bps / 2.0,
             )
             if not lq_eval.passed:
-                self._liquidity_rejections += 1
                 if lq_eval.reason == LiquidityRejectionReason.SPREAD_TOO_WIDE:
-                    self._spread_rejections += 1
+                    reason = "spread"
                 elif lq_eval.reason == LiquidityRejectionReason.MARKET_DATA_STALE:
-                    self._stale_market_rejections += 1
+                    reason = "stale_market"
+                else:
+                    reason = "liquidity"
+                self._record_pipeline_rejection(reason, symbol=canonical)
                 continue
+
+            # Record this only-after-live observation before signal assessment;
+            # it is never derived from a future candle or exit outcome.
+            self.entry_quality.observe_market(feat)
 
             # Build qualified AssetSnapshot
             depth_10bps = book.depth_within_bps(10) if book else 0.0
@@ -1139,6 +1297,20 @@ class PaperTradingOrchestrator:
         evaluated_signal_keys: set[str] = set()
         if snapshots:
             scanner_signals = self.scanner.scan(snapshots)
+            diagnostics = self.scanner.last_diagnostics
+            for scanner_reason, count in diagnostics.safety_rejections.items():
+                normalized = scanner_reason.lower()
+                if "spread" in normalized:
+                    reason = "spread"
+                elif "volume" in normalized or "depth" in normalized or "bid/ask" in normalized:
+                    reason = "liquidity"
+                else:
+                    reason = "scanner_safety"
+                for _ in range(count):
+                    self._record_pipeline_rejection(reason, strategy_id="global_scanner")
+            for _ in range(diagnostics.below_confidence_threshold + diagnostics.capped_signals):
+                self._record_pipeline_rejection("below_score", strategy_id="global_scanner")
+
             converted_scanner_signals = self.scanner.to_strategy_signals(scanner_signals)
             strategy_signals.extend(converted_scanner_signals)
             for snap in snapshots:
@@ -1159,12 +1331,16 @@ class PaperTradingOrchestrator:
                     )
                     try:
                         sig = await strat.analyze(features=feat)  # type: ignore[call-arg]
-                        if sig and not sig.is_expired:
+                        if sig is not None:
                             strategy_signals.append(sig)
                         else:
                             self._no_signal_decisions += 1
+                            self._record_inactive_signal("strategy_inactive", sid, canonical)
                     except Exception:
                         self._exceptions += 1
+                        self._record_pipeline_rejection(
+                            "strategy_exception", strategy_id=sid, symbol=canonical
+                        )
 
         # Activity mode uses the same identity/cost/entry gates as organic
         # signals; only its signal source is synthetic.
@@ -1176,32 +1352,91 @@ class PaperTradingOrchestrator:
                     self.signal_guard.key(signal.strategy_id, signal.symbol)
                 )
 
+        # Raw means a concrete object emitted by a scanner/strategy.  ``None``
+        # decisions were already counted as inactive above, rather than being
+        # conflated with a raw signal.
+        self.funnel.increment("raw_signals", len(strategy_signals))
+        strategy_signals = self.signal_guard.observe_cycle(strategy_signals, evaluated_signal_keys)
+        valid_signals: list[Any] = []
         for signal in strategy_signals:
+            is_valid, invalid_reason = self._valid_signal(signal)
+            if not is_valid:
+                self._record_inactive_signal(
+                    invalid_reason, signal.strategy_id, signal.symbol
+                )
+                continue
             self._annotate_signal_cost(signal)
-        strategy_signals = self.signal_guard.observe_cycle(
-            strategy_signals, evaluated_signal_keys
-        )
-        self._total_signals += len(strategy_signals)
+            valid_signals.append(signal)
+        self.funnel.increment("valid_signals", len(valid_signals))
+        self._total_signals = self.funnel.counters["raw_signals"]
         self._persist_protection_state()
 
-        if not strategy_signals:
+        if not valid_signals:
             self._total_scans += 1
             return
 
-        # ── 5. OPPORTUNITY EVALUATION & RANKING ──
+        # ── 5. OPPORTUNITY EVALUATION, QUALITY, & RANKING ──
         evaluated_opportunities = [
-            self.opportunity_engine.evaluate(signal) for signal in strategy_signals
+            self.opportunity_engine.evaluate(signal) for signal in valid_signals
         ]
-        self._total_opportunities += len(evaluated_opportunities)
+        self.funnel.increment("opportunities_created", len(evaluated_opportunities))
+        self._total_opportunities = self.funnel.counters["opportunities_created"]
         opportunities = []
         for opportunity in evaluated_opportunities:
-            if opportunity.status.value == "ranked":
-                opportunities.append(opportunity)
-            elif (
-                opportunity.rejection_reason is not None
-                and opportunity.rejection_reason.value == "insufficient_expected_edge"
-            ):
-                self._record_entry_rejection("expected_edge")
+            strategy_id = opportunity.signal.strategy_id
+            symbol = opportunity.signal.symbol
+            if opportunity.status.value != "ranked":
+                rejection = opportunity.rejection_reason.value if opportunity.rejection_reason else "opportunity_rejected"
+                if rejection == "insufficient_expected_edge":
+                    reason = "expected_edge"
+                elif rejection == "insufficient_confidence":
+                    reason = "confidence"
+                elif rejection == "low_score":
+                    reason = "below_score"
+                elif rejection in {"expired_signal", "stale_data"}:
+                    reason = "stale_market"
+                elif rejection == "liquidity":
+                    reason = "liquidity"
+                else:
+                    reason = "opportunity_rejected"
+                self._record_pipeline_rejection(
+                    reason,
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    entry_attempt=True,
+                )
+                continue
+
+            feat = self.features.get(symbol or "")
+            quality = self.entry_quality.assess(opportunity.signal, feat)
+            opportunity.metadata["entry_quality"] = {
+                "score": quality.quality_score,
+                "required_score": quality.required_score,
+                "momentum_multiple": quality.momentum_multiple,
+                "required_momentum_multiple": quality.required_momentum_multiple,
+                "reversal_risk": quality.reversal_risk,
+                "market_structure_score": quality.market_structure_score,
+                "volatility_pct": quality.volatility_pct,
+                "signal_persistence": quality.signal_persistence,
+                "reasons": list(quality.reasons),
+            }
+            if not quality.passed:
+                # This is deliberately classified as a score-stage rejection:
+                # the opportunity was economically viable but lacked a robust,
+                # volatility-normalized entry setup.
+                self._record_pipeline_rejection(
+                    "below_score",
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    entry_attempt=True,
+                )
+                # Detailed component reasons remain attached to the evaluated
+                # opportunity for audit/log persistence without turning one
+                # rejected candidate into several percentage-denominator rows.
+                continue
+            self.funnel.increment("qualified_opportunities")
+            opportunities.append(opportunity)
+
         opportunities.sort(key=lambda item: item.score.final_score, reverse=True)
         if not opportunities:
             self._total_scans += 1
@@ -1210,7 +1445,12 @@ class PaperTradingOrchestrator:
 
         if entries_globally_blocked:
             logger.warning("risk_circuit_breaker_active_entries_blocked")
+            for opp in opportunities:
+                self._record_entry_rejection(
+                    "risk", strategy_id=opp.signal.strategy_id, symbol=opp.signal.symbol
+                )
             self._total_scans += 1
+            self._persist_protection_state()
             return
 
         # ── 6. RISK & PORTFOLIO CAPACITY ALLOCATION ──
@@ -1222,75 +1462,132 @@ class PaperTradingOrchestrator:
         tier_state = self.tier_manager.determine_tier(self.account.state.equity)
         available = max(0, tier_state.target_slots - len(self.account.state.open_positions))
         if available <= 0:
+            for opp in opportunities:
+                self._record_entry_rejection(
+                    "capacity", strategy_id=opp.signal.strategy_id, symbol=opp.signal.symbol
+                )
             self._total_scans += 1
+            self._persist_protection_state()
             return
 
+        open_positions = self.account.state.open_positions
+        asset_exposure: dict[str, float] = {}
+        strategy_exposure: dict[str, float] = {}
+        for symbol, position in open_positions.items():
+            base_asset = symbol.split("-")[0] if "-" in symbol else symbol
+            asset_exposure[base_asset] = asset_exposure.get(base_asset, 0.0) + position.notional
+            strategy_exposure[position.strategy_id or "unknown"] = (
+                strategy_exposure.get(position.strategy_id or "unknown", 0.0) + position.notional
+            )
         pf_state = PortfolioState(
             total_equity=self.account.state.equity,
             available_cash=self.account.state.cash,
-            active_symbols=set(self.account.state.open_positions.keys()),
+            positions={symbol: pos.notional for symbol, pos in open_positions.items()},
+            asset_exposure=asset_exposure,
+            strategy_exposure=strategy_exposure,
+            exchange_exposure={"binance": self.account.state.allocated},
+            active_symbols=set(open_positions.keys()),
+            total_exposure_pct=(
+                self.account.state.allocated / max(self.account.state.equity, 1e-9) * 100.0
+            ),
         )
 
         opened_this_tick = 0
         for opp in opportunities:
-            if opened_this_tick >= available:
-                break
+            strategy_id = opp.signal.strategy_id
             sym = opp.signal.symbol or "unknown"
+            if opened_this_tick >= available:
+                # Do not break: each ranked candidate is accounted for rather
+                # than disappearing once the current slot budget is full.
+                self._record_entry_rejection("capacity", strategy_id=strategy_id, symbol=sym)
+                continue
             if sym in self.account.state.open_positions:
+                self._record_entry_rejection("capacity", strategy_id=strategy_id, symbol=sym)
                 continue
 
-            # Cooldown is per symbol and is checked before freshness so an
-            # attempted immediate re-entry is explicitly observable as such.
-            is_symbol_eligible, _ = self.symbol_risk.is_symbol_eligible(
-                sym, self.account.state.equity
-            )
-            if not is_symbol_eligible:
-                self._record_entry_rejection("cooldown")
-                continue
-
+            # First establish freshness.  A continuous predicate that has
+            # already opened a position is a re-entry rejection, not evidence
+            # that a market failed its cooldown.
             is_fresh, _ = self.signal_guard.can_enter(opp.signal)
             if not is_fresh:
-                self._record_entry_rejection("duplicate_signal")
+                self._record_entry_rejection(
+                    "duplicate_signal", strategy_id=strategy_id, symbol=sym
+                )
+                continue
+
+            quality_metadata = opp.metadata.get("entry_quality", {})
+            try:
+                signal_sequence = int(opp.signal.metadata.get("signal_sequence", 0))
+            except (TypeError, ValueError):
+                signal_sequence = 0
+            reentry = self.symbol_risk.evaluate_entry(
+                ReentryContext(
+                    symbol=sym,
+                    direction=opp.signal.direction.value,
+                    strategy_id=strategy_id,
+                    confidence=opp.signal.confidence,
+                    signal_id=opp.signal.signal_id,
+                    signal_sequence=signal_sequence,
+                    fresh_signal=self.signal_guard.is_new_sequence(opp.signal),
+                    market_structure_score=float(
+                        quality_metadata.get("market_structure_score", 0.0)
+                    ),
+                    market_volatility_pct=float(quality_metadata.get("volatility_pct", 0.0)),
+                ),
+                self.account.state.equity,
+            )
+            if not reentry.allowed:
+                reentry_reason = "reentry" if reentry.reason.startswith("REENTRY_") else "cooldown"
+                self._record_entry_rejection(
+                    reentry_reason, strategy_id=strategy_id, symbol=sym
+                )
                 continue
 
             is_strat_eligible, _ = self.strategy_risk.is_strategy_eligible(
-                opp.signal.strategy_id, self.account.state.equity
+                strategy_id, self.account.state.equity
             )
             if not is_strat_eligible:
-                self._record_entry_rejection("strategy_risk")
+                self._record_entry_rejection("strategy_risk", strategy_id=strategy_id, symbol=sym)
                 continue
 
             self._risk_assessments += 1
             risk = self.risk_engine.assess(opp)
             if risk.decision.value != "approved":
-                self._risk_rejected += 1
-                self._record_entry_rejection("risk")
+                self._record_entry_rejection("risk", strategy_id=strategy_id, symbol=sym)
                 continue
             self._risk_approved += 1
+            self.funnel.increment("approved_opportunities")
             if risk.stop_loss_price is None:
-                self._record_entry_rejection("missing_stop")
+                self._record_entry_rejection("missing_stop", strategy_id=strategy_id, symbol=sym)
                 continue
 
             feat = self.features.get(sym)
             book = self.order_book_engine.get_book("binance", sym)
             if not book or not book.asks.levels or not book.bids.levels:
-                self._record_entry_rejection("missing_book")
+                self._record_entry_rejection("missing_book", strategy_id=strategy_id, symbol=sym)
                 continue
 
+            # Strategy evidence can only reduce (never increase) an allocation,
+            # and only after the strategy manager has enough observations.
+            allocation_multiplier = self.strategy_risk.allocation_multiplier(strategy_id)
             cap = PositionCapacity(
                 symbol=sym,
-                strategy_id=opp.signal.strategy_id,
-                max_efficient_size=min(risk.max_position_size, self.account.state.cash * 0.2),
+                strategy_id=strategy_id,
+                max_efficient_size=min(
+                    risk.max_position_size, self.account.state.cash * 0.2
+                ) * allocation_multiplier,
                 is_viable=True,
             )
             decisions = self.allocator.allocate(pf_state, [(opp, risk, cap)])
             if not decisions or not decisions[0].is_allocated:
-                self._record_entry_rejection("allocation")
+                allocation_reason = decisions[0].rejection_reason.lower() if decisions else ""
+                reason = "correlation" if "correlation" in allocation_reason else "capacity"
+                self._record_entry_rejection(reason, strategy_id=strategy_id, symbol=sym)
                 continue
 
-            allocated_capital = decisions[0].allocated_capital
+            allocated_capital = decisions[0].allocated_capital * allocation_multiplier
             if allocated_capital < 50.0:
-                self._record_entry_rejection("minimum_notional")
+                self._record_entry_rejection("minimum_notional", strategy_id=strategy_id, symbol=sym)
                 continue
 
             # ── 7. EXECUTION-AWARE SIZING & ACTUAL COST GATE ──
@@ -1306,18 +1603,16 @@ class PaperTradingOrchestrator:
             )
             if safe_qty * feat.ask < 50.0:
                 self._participation_rejections += 1
-                self._liquidity_rejections += 1
-                self._record_entry_rejection("participation")
+                self._record_entry_rejection("participation", strategy_id=strategy_id, symbol=sym)
                 continue
 
             entry_sim = self.execution_estimator.simulate_buy_entry(sym, book, safe_qty)
             if not entry_sim.passed:
-                self._liquidity_rejections += 1
                 if entry_sim.rejection_reason == LiquidityRejectionReason.ENTRY_SLIPPAGE_TOO_HIGH:
                     self._entry_slippage_rejections += 1
                 elif entry_sim.rejection_reason == LiquidityRejectionReason.PARTICIPATION_TOO_HIGH:
                     self._participation_rejections += 1
-                self._record_entry_rejection("entry_execution")
+                self._record_entry_rejection("entry_execution", strategy_id=strategy_id, symbol=sym)
                 continue
 
             exit_sim = self.execution_estimator.simulate_sell_exit(
@@ -1327,39 +1622,42 @@ class PaperTradingOrchestrator:
                 stop_loss_pct=self.risk_engine.default_stop_loss_pct,
             )
             if not exit_sim.passed:
-                self._liquidity_rejections += 1
                 if exit_sim.rejection_reason == LiquidityRejectionReason.EXIT_SLIPPAGE_TOO_HIGH:
                     self._exit_slippage_rejections += 1
-                self._record_entry_rejection("exit_execution")
+                self._record_entry_rejection("exit_execution", strategy_id=strategy_id, symbol=sym)
                 continue
 
-            cost_estimate = self.paper_exec.estimate_round_trip_cost(
+            expected_edge = self.paper_exec.estimate_expected_net_edge(
                 entry_sim.filled_qty,
                 entry_sim.expected_vwap,
                 exit_sim.exit_vwap,
+                float(opp.signal.estimated_return or 0.0),
+                self._paper_config.min_expected_edge_over_cost,
             )
-            expected_return = opp.signal.estimated_return
-            required_return = (
-                cost_estimate.estimated_round_trip_cost_fraction
-                + self._paper_config.min_expected_edge_over_cost
-            )
-            if expected_return is None or expected_return < required_return:
-                self._record_entry_rejection("expected_edge")
+            if not expected_edge.is_positive_after_costs:
+                self._record_entry_rejection("expected_edge", strategy_id=strategy_id, symbol=sym)
                 continue
 
             opp.signal.metadata.update({
-                "estimated_entry_fee": cost_estimate.estimated_entry_fee,
-                "estimated_exit_fee": cost_estimate.estimated_exit_fee,
-                "estimated_slippage": cost_estimate.estimated_slippage,
-                "estimated_spread_cost": cost_estimate.estimated_spread_cost,
-                "estimated_round_trip_cost": cost_estimate.estimated_round_trip_cost,
+                "expected_gross_edge_fraction": expected_edge.expected_gross_edge_fraction,
+                "expected_gross_edge_usd": expected_edge.expected_gross_edge_usd,
+                "estimated_entry_fee": expected_edge.estimated_entry_fee,
+                "estimated_exit_fee": expected_edge.estimated_exit_fee,
+                "estimated_slippage": expected_edge.expected_slippage,
+                "estimated_spread_cost": expected_edge.estimated_spread_cost,
+                "estimated_round_trip_cost": expected_edge.costs.estimated_round_trip_cost,
                 "estimated_round_trip_cost_fraction": (
-                    cost_estimate.estimated_round_trip_cost_fraction
+                    expected_edge.costs.estimated_round_trip_cost_fraction
                 ),
+                "safety_buffer_fraction": expected_edge.safety_buffer_fraction,
+                "expected_net_edge_fraction": expected_edge.expected_net_edge_fraction,
+                "expected_net_edge_usd": expected_edge.expected_net_edge_usd,
+                "strategy_allocation_multiplier": allocation_multiplier,
             })
 
             # ── 8. ORDER CREATION & PAPER EXECUTION ──
             asks_depth = [(level[0], level[1]) for level in book.asks.levels]
+            self.funnel.increment("execution_attempts")
             entry_fill = await self.paper_exec.simulate_fill(
                 sym,
                 "buy",
@@ -1370,7 +1668,7 @@ class PaperTradingOrchestrator:
                 asks_depth=asks_depth,
             )
             if not entry_fill or entry_fill.filled_qty <= 0:
-                self._record_entry_rejection("entry_fill")
+                self._record_entry_rejection("entry_fill", strategy_id=strategy_id, symbol=sym)
                 continue
 
             order_id = (
@@ -1418,8 +1716,22 @@ class PaperTradingOrchestrator:
             actual_cost_estimate = self.paper_exec.estimate_round_trip_cost(
                 quantity, entry_fill.vwap_price, exit_sim.exit_vwap
             )
-            trail_distance_fraction = self._paper_config.trail_distance_pct / 100.0
-            fee_aware_activation_pct = self._paper_config.trail_activation_pct
+            quality_metadata = opp.metadata.get("entry_quality", {})
+            trail_params = compute_volatility_aware_trail(
+                base_trail_distance_pct=self._paper_config.trail_distance_pct,
+                base_activation_pct=self._paper_config.trail_activation_pct,
+                volatility_pct=float(quality_metadata.get("volatility_pct", 0.0)),
+                spread_bps=feat.spread_bps,
+                round_trip_cost_fraction=actual_cost_estimate.estimated_round_trip_cost_fraction,
+                volatility_multiplier=self._paper_config.trail_volatility_multiplier,
+                spread_multiplier=self._paper_config.trail_spread_multiplier,
+                activation_volatility_multiplier=(
+                    self._paper_config.trail_activation_volatility_multiplier
+                ),
+                max_trail_distance_pct=self._paper_config.max_trail_distance_pct,
+            )
+            trail_distance_fraction = trail_params.trail_distance_pct / 100.0
+            fee_aware_activation_pct = trail_params.activation_pct
             if trail_distance_fraction < 1.0:
                 fee_aware_activation_pct = max(
                     fee_aware_activation_pct,
@@ -1458,10 +1770,25 @@ class PaperTradingOrchestrator:
                     "estimated_round_trip_cost_fraction": (
                         actual_cost_estimate.estimated_round_trip_cost_fraction
                     ),
+                    "expected_gross_edge_fraction": expected_edge.expected_gross_edge_fraction,
+                    "expected_net_edge_fraction": expected_edge.expected_net_edge_fraction,
+                    "expected_net_edge_usd": expected_edge.expected_net_edge_usd,
+                    "safety_buffer_fraction": expected_edge.safety_buffer_fraction,
+                    "entry_quality_score": quality_metadata.get("score", 0.0),
+                    "entry_quality_required_score": quality_metadata.get("required_score", 0.0),
+                    "market_structure_score": quality_metadata.get("market_structure_score", 0.0),
+                    "entry_volatility_pct": quality_metadata.get("volatility_pct", 0.0),
+                    "signal_persistence": quality_metadata.get("signal_persistence", 0),
+                    "signal_sequence": signal_sequence,
+                    "effective_trail_distance_pct": trail_params.trail_distance_pct,
+                    "effective_trail_activation_pct": fee_aware_activation_pct,
+                    "trail_volatility_component_pct": trail_params.volatility_component_pct,
+                    "trail_spread_component_pct": trail_params.spread_component_pct,
+                    "strategy_allocation_multiplier": allocation_multiplier,
                 },
             )
             if not pos:
-                self._record_entry_rejection("account")
+                self._record_entry_rejection("account", strategy_id=strategy_id, symbol=sym)
                 continue
 
             # Consume only after a position was actually created.  Persisting
@@ -1470,6 +1797,7 @@ class PaperTradingOrchestrator:
             self._persist_protection_state()
             pos_id = f"pos-{sym}"
             self.monitor.register_position(pos)
+            self.funnel.increment("successful_entries")
             self._positions_opened_total += 1
             self._total_trades += 1
             opened_this_tick += 1
@@ -1492,6 +1820,14 @@ class PaperTradingOrchestrator:
             self._persist_position(pos_id, pos)
             self._persist_trail(pos_id)
             self._persist_account()
+            # Keep subsequent allocations in this scan aware of capital and
+            # symbol exposure already committed by an earlier candidate.
+            pf_state.active_symbols.add(sym)
+            pf_state.positions[sym] = pos.notional
+            pf_state.available_cash = self.account.state.cash
+            pf_state.total_exposure_pct = (
+                self.account.state.allocated / max(self.account.state.equity, 1e-9) * 100.0
+            )
             self._reconcile_risk()
 
         self._total_scans += 1
@@ -1583,10 +1919,24 @@ class PaperTradingOrchestrator:
             self._sample_resource_peak()
             self._persist_runtime_state()
             s = self.account.state
+            elapsed_hours = max(1e-9, (time.monotonic() - self._start_time) / 3600.0)
+            funnel = self.funnel.funnel()
             logger.info(
-                "paper_status", equity=round(s.equity, 0), pnl=round(s.realized_pnl, 0),
-                positions=len(s.open_positions), trades=s.trade_count,
-                pub=self.publish_count, con=self.consume_count,
+                "paper_status",
+                equity=round(s.equity, 0),
+                pnl=round(s.realized_pnl, 0),
+                positions=len(s.open_positions),
+                trades=s.trade_count,
+                opportunities_per_hour=round(funnel["opportunities_created"] / elapsed_hours, 3),
+                qualified_opportunities_per_hour=round(
+                    funnel["qualified_opportunities"] / elapsed_hours, 3
+                ),
+                entries_per_hour=round(funnel["successful_entries"] / elapsed_hours, 3),
+                rejected_entries=self.funnel.entry_rejections,
+                net_expectancy=round(s.realized_pnl / s.trade_count, 6) if s.trade_count else 0.0,
+                drawdown_pct=round(s.max_drawdown_pct, 6),
+                pub=self.publish_count,
+                con=self.consume_count,
             )
 
     def _touch_heartbeat(self) -> None:
@@ -1601,43 +1951,91 @@ class PaperTradingOrchestrator:
         return feat.bid if feat.bid > 0 else 0.0
 
     def _final_report(self) -> dict[str, Any]:
-        s = self.account.state
-        wall_secs = (datetime.now(UTC) - self._wall_start).total_seconds() if self._wall_start else 0
-        rss_now = _get_memory_mb()
+        """Return the complete paper-session diagnostic report.
 
-        # Compute slippage percentiles
+        The established flat keys are kept for dashboards that already consume
+        them.  The nested sections are the durable reporting contract for the
+        signal funnel, performance, exits, strategy evidence, and symbols.
+        """
+        s = self.account.state
+        duration_seconds = max(0.0, time.monotonic() - self._start_time)
+        wall_secs = (
+            (datetime.now(UTC) - self._wall_start).total_seconds() if self._wall_start else 0.0
+        )
+        rss_now = _get_memory_mb()
         slips = self._slippage_bps_list
         avg_slip = (sum(slips) / len(slips)) if slips else 0.0
         max_slip = max(slips) if slips else 0.0
-        p95_slip = sorted(slips)[int(len(slips) * 0.95)] if slips else 0.0
+        p95_slip = sorted(slips)[min(len(slips) - 1, int(len(slips) * 0.95))] if slips else 0.0
+        try:
+            task_count_end = len(asyncio.all_tasks())
+        except RuntimeError:
+            task_count_end = 0
 
+        trades = list(s.closed_trades)
+        performance = trade_metrics(trades)
+        exits = exit_analysis(trades)
+        strategy_analysis = self.strategy_risk.get_summary()
+        symbol_analysis = grouped_trade_metrics(trades, "symbol")
+        symbol_rejections = self.funnel.per_symbol_rejections()
+        for symbol, reasons in symbol_rejections.items():
+            symbol_analysis.setdefault(symbol, trade_metrics([]))["rejection_reasons"] = reasons
+
+        funnel = self.funnel.funnel()
+        signal_funnel = {
+            "raw_signals": funnel["raw_signals"],
+            "qualified_signals": funnel["valid_signals"],
+            "valid_signals": funnel["valid_signals"],
+            "inactive_signals": funnel["inactive_signals"],
+            "opportunities": funnel["opportunities_created"],
+            "opportunities_created": funnel["opportunities_created"],
+            "approved_opportunities": funnel["approved_opportunities"],
+            "qualified_opportunities": funnel["qualified_opportunities"],
+            "entries": funnel["successful_entries"],
+            "execution_attempts": funnel["execution_attempts"],
+            "successful_entries": funnel["successful_entries"],
+            "closed_trades": funnel["closed_trades"],
+        }
+        hours = duration_seconds / 3600.0
+        throughput = {
+            "opportunities_per_hour": round(
+                funnel["opportunities_created"] / hours if hours > 0 else 0.0, 4
+            ),
+            "qualified_opportunities_per_hour": round(
+                funnel["qualified_opportunities"] / hours if hours > 0 else 0.0, 4
+            ),
+            "entries_per_hour": round(
+                funnel["successful_entries"] / hours if hours > 0 else 0.0, 4
+            ),
+            "net_expectancy": performance["expectancy"],
+            "profit_factor": performance["profit_factor"],
+            "max_drawdown_pct": round(s.max_drawdown_pct, 6),
+        }
         status = "FAILED" if self._fatal_error else "complete"
-        gross_realized = sum(trade.gross_pnl for trade in s.closed_trades)
-        closed_trading_costs = sum(
-            trade.fees + trade.slippage_cost for trade in s.closed_trades
-        )
-        return {
+        closed_trading_costs = performance["fees"] + performance["slippage"]
+        report: dict[str, Any] = {
             "status": status,
             "fatal_error": self._fatal_error,
-            "duration_seconds": time.monotonic() - self._start_time,
+            "duration_seconds": duration_seconds,
             "wall_seconds": wall_secs,
             "initial_balance": self.initial_balance,
             "final_equity": round(s.equity, 2),
             "net_pnl": round(s.equity - s.initial_balance, 2),
             "realized_net_pnl": round(s.realized_pnl, 2),
             "unrealized_pnl": round(s.unrealized_pnl, 2),
-            "gross_realized_pnl": round(gross_realized, 4),
+            "gross_realized_pnl": performance["gross_pnl"],
             "closed_trading_costs": round(closed_trading_costs, 4),
             "total_fees": round(s.total_fees, 4),
             "total_slippage": round(s.total_slippage, 4),
             "total_trades": s.trade_count,
-            "wins": s.win_count, "losses": s.loss_count,
-            "win_rate": round(s.win_count / s.trade_count * 100.0, 2) if s.trade_count > 0 else 0.0,
-            "total_signals": self._total_signals,
-            "total_opportunities": self._total_opportunities,
+            "wins": s.win_count,
+            "losses": s.loss_count,
+            "win_rate": round(s.win_count / s.trade_count * 100.0, 2) if s.trade_count else 0.0,
+            "total_signals": funnel["raw_signals"],
+            "total_opportunities": funnel["opportunities_created"],
             "risk_assessments": self._risk_assessments,
             "risk_approved": self._risk_approved,
-            "risk_rejected": self._risk_rejected,
+            "risk_rejected": funnel["risk_rejections"],
             "orders_created": self._orders_created,
             "fills_created": self._fills_created,
             "partial_fills": self._partial_fills,
@@ -1648,18 +2046,20 @@ class PaperTradingOrchestrator:
             "trailing_exits": self._trailing_exits,
             "hard_stop_exits": self._hard_stop_exits,
             "liquidity_checks": self._liquidity_checks,
-            "liquidity_rejections": self._liquidity_rejections,
-            "spread_rejections": self._spread_rejections,
+            "liquidity_rejections": funnel["liquidity_rejections"],
+            "spread_rejections": funnel["spread_rejections"],
             "entry_slippage_rejections": self._entry_slippage_rejections,
             "exit_slippage_rejections": self._exit_slippage_rejections,
             "participation_rejections": self._participation_rejections,
-            "stale_market_rejections": self._stale_market_rejections,
-            "rejected_entries": self._rejected_entries,
-            "reentry_rejections": self._reentry_rejections,
-            "symbol_cooldown_rejections": self._symbol_cooldown_rejections,
+            "stale_market_rejections": funnel["stale_market_rejections"],
+            "rejected_entries": self.funnel.entry_rejections,
+            "reentry_rejections": funnel["reentry_rejections"],
+            "symbol_cooldown_rejections": funnel["cooldown_rejections"],
+            "cooldown_rejections": funnel["cooldown_rejections"],
             "duplicate_signal_rejections": self._duplicate_signal_rejections,
-            "expected_edge_rejections": self._expected_edge_rejections,
+            "expected_edge_rejections": funnel["expected_edge_rejections"],
             "consecutive_loss_events": self.symbol_risk.consecutive_loss_events_count,
+            "early_reentries_allowed": self.symbol_risk.early_reentries_allowed_count,
             "average_slippage_bps": round(avg_slip, 2),
             "p95_slippage_bps": round(p95_slip, 2),
             "max_slippage_bps": round(max_slip, 2),
@@ -1677,11 +2077,22 @@ class PaperTradingOrchestrator:
             "rss_end_mb": rss_now,
             "task_count_start": self._task_count_start,
             "task_count_peak": self._task_count_peak,
-            "task_count_end": len(asyncio.all_tasks()),
+            "task_count_end": task_count_end,
             "queue_depth_peak": self._queue_depth_peak,
-            "strategy_metrics": self.strategy_risk.get_summary(),
-            "mode": "PAPER", "live_trading": "DISABLED",
+            "strategy_metrics": strategy_analysis,
+            "mode": "PAPER",
+            "live_trading": "DISABLED",
+            # Required end-of-session diagnostics.
+            "signal_funnel": signal_funnel,
+            "funnel_counters": funnel,
+            "rejection_breakdown": self.funnel.rejection_breakdown(),
+            "trade_performance": performance,
+            "exit_analysis": exits,
+            "strategy_analysis": strategy_analysis,
+            "symbol_analysis": symbol_analysis,
+            "throughput": throughput,
         }
+        return cast(dict[str, Any], finite_report_value(report))
 
     def stop(self) -> None:
         self._running = False

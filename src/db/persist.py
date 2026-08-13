@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS runtime_lease(account_id TEXT PRIMARY KEY,owner_id TE
 CREATE TABLE IF NOT EXISTS paper_closed_trades(trade_id TEXT PRIMARY KEY,symbol TEXT,direction TEXT,entry_price REAL,exit_price REAL,quantity REAL,gross_pnl REAL,fees REAL,slippage_cost REAL,net_pnl REAL,return_pct REAL,exit_reason TEXT,strategy_id TEXT DEFAULT '',entry_time TEXT,exit_time TEXT,created_at TEXT);
 CREATE TABLE IF NOT EXISTS paper_symbol_risk(symbol TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
 CREATE TABLE IF NOT EXISTS paper_signal_state(signal_key TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_strategy_risk(strategy_id TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
+CREATE TABLE IF NOT EXISTS paper_telemetry_state(state_key TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at TEXT);
 CREATE TABLE IF NOT EXISTS paper_runtime_metrics(metric_name TEXT PRIMARY KEY,metric_value REAL NOT NULL DEFAULT 0,updated_at TEXT);"""
 
 
@@ -73,6 +75,7 @@ class PaperPersistence:
             "paper_trail": {
                 "activation_price": "REAL DEFAULT 0",
                 "activation_pct": "REAL DEFAULT 0",
+                "trail_distance_pct": "REAL DEFAULT 0",
             },
             "paper_closed_trades": {
                 "entry_fee": "REAL DEFAULT 0",
@@ -216,13 +219,14 @@ class PaperPersistence:
     def save_trail(self, pid: str, t: dict) -> None:
         with self._tx() as c:
             c.execute(
-                "INSERT OR REPLACE INTO paper_trail(position_id,trail_peak,trail_level,activation_price,activation_pct,trail_activated,exit_intent_active,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO paper_trail(position_id,trail_peak,trail_level,activation_price,activation_pct,trail_distance_pct,trail_activated,exit_intent_active,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     pid,
                     t.get("trail_peak", 0),
                     t.get("trail_level", 0),
                     t.get("activation_price", 0),
                     t.get("activation_pct", 0),
+                    t.get("trail_distance_pct", 0),
                     1 if t.get("trail_activated") else 0,
                     1 if t.get("exit_intent_active") else 0,
                     self._now(),
@@ -475,6 +479,46 @@ class PaperPersistence:
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         return result
+
+    def save_strategy_risk_state(self, state: dict[str, Any]) -> None:
+        with self._tx() as c:
+            for strategy_id, value in state.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO paper_strategy_risk(strategy_id,state_json,updated_at) VALUES(?,?,?)",
+                    (str(strategy_id), json.dumps(value), self._now()),
+                )
+
+    def load_strategy_risk_state(self) -> dict[str, Any]:
+        if not self._conn:
+            return {}
+        result: dict[str, Any] = {}
+        for row in self._conn.execute("SELECT strategy_id,state_json FROM paper_strategy_risk"):
+            try:
+                result[str(row["strategy_id"])] = json.loads(row["state_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return result
+
+    def save_telemetry_state(self, state_key: str, state: dict[str, Any]) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO paper_telemetry_state(state_key,state_json,updated_at) VALUES(?,?,?)",
+                (state_key, json.dumps(state), self._now()),
+            )
+
+    def load_telemetry_state(self, state_key: str) -> dict[str, Any]:
+        if not self._conn:
+            return {}
+        row = self._conn.execute(
+            "SELECT state_json FROM paper_telemetry_state WHERE state_key=?", (state_key,)
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            loaded = json.loads(row["state_json"])
+            return loaded if isinstance(loaded, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
 
     def save_runtime_metrics(self, metrics: dict[str, float | int]) -> None:
         with self._tx() as c:

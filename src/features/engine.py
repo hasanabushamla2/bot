@@ -97,6 +97,10 @@ class FeatureEngine:
             if rets:
                 m = sum(rets) / len(rets)
                 feat.volatility_5m_pct = math.sqrt(sum((r - m) ** 2 for r in rets) / len(rets))
+                # Tick-based ATR proxy: mean absolute realized movement.  It
+                # uses only completed observations already in the rolling
+                # buffer and is intentionally distinct from dispersion.
+                feat.atr_pct = sum(abs(r) for r in rets) / len(rets)
         feat.trend_strength = self._trend(pw, ts)
         k = symbol
         if k not in self._va:

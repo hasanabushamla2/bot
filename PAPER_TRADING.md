@@ -131,7 +131,12 @@ strategy is profitable.
 | `LOSS_COOLDOWN_SECONDS` | `300` | Minimum same-symbol delay after a net loss |
 | `WIN_COOLDOWN_SECONDS` | `30` | Shorter delay after a net win |
 | `TRAIL_ACTIVATION_PCT` | `0.20` | Configured activation floor; runtime raises it when costs require |
-| `TRAIL_DISTANCE_PCT` | `0.20` | Favorable high-water-mark trail distance |
+| `TRAIL_DISTANCE_PCT` | `0.20` | Minimum favorable high-water-mark trail distance |
+| `TRAIL_VOLATILITY_MULTIPLIER` | `1.50` | Widens a per-position trail by realized volatility; never tightens below the floor |
+| `TRAIL_SPREAD_MULTIPLIER` | `2.00` | Includes current bid/ask microstructure noise in the trail distance |
+| `MAX_TRAIL_DISTANCE_PCT` | `1.25` | Safety cap for a volatility-expanded trail; no fixed profit ceiling is introduced |
+| `MATERIAL_REENTRY_CONFIDENCE_IMPROVEMENT` | `0.10` | Required confidence improvement for an early re-entry after a profitable trail |
+| `MIN_REENTRY_MARKET_STRUCTURE_SCORE` | `0.55` | Minimum trend/breakout/flow structure score for that early re-entry |
 | `MAX_CONSECUTIVE_LOSSES_PER_SYMBOL` | `2` | Loss count that triggers temporary lockout |
 | `SYMBOL_LOCKOUT_SECONDS` | `1800` | Temporary lockout after the threshold |
 | `SYMBOL_LOSS_STREAK_RESET_SECONDS` | `21600` | Inactivity interval that decays a loss streak |
@@ -145,6 +150,42 @@ A consumed signal remains blocked after cooldown until its strategy condition
 has been observed false and subsequently becomes valid again. Explicit stable
 `signal_id` values from event-driven strategy plugins are also supported.
 Cooldown and signal-consumption state are persisted in the soak database.
+
+### Adaptive re-entry and entry quality
+
+A losing hard-stop is never bypassed: its cooldown is scaled from realized loss
+severity, stop-out sequence, and live volatility. A profitable `trail_hit` can
+re-enter before the short win cooldown expires only when all of the following
+are true:
+
+1. The guard observed a new signal sequence, rather than the prior continuous
+   predicate.
+2. The new confidence is materially stronger than the confidence used for the
+   prior entry (with a volatility-aware uplift).
+3. The new signal is directionally aligned and its normalized market-structure
+   score (trend, momentum, breakout/flow confirmation) remains sufficient.
+
+The pre-entry quality gate uses volatility-normalized momentum, trend,
+breakout/range confirmation, live volume/liquidity, spread, visible-book
+imbalance when available, signal persistence, and short-term reversal risk.
+It does not inspect future candles. It does not alter hard stops, leverage, or
+position-size limits.
+
+### Session diagnostic report
+
+Every paper-session result exposes these structured sections, and
+`analyze_paper_run.py` renders them for durable SQLite runs:
+
+- **SIGNAL FUNNEL:** raw, qualified, opportunities, approved, entries, and
+  closed trades plus explicit counters for every filtering stage.
+- **REJECTION BREAKDOWN:** primary reason counts and percentages; no silent
+  capacity, open-symbol, scanner, or entry gate path.
+- **TRADE PERFORMANCE:** gross PnL, fees, slippage, net PnL, profit factor,
+  expectancy, winners/losers, MFE/MAE, and holding durations.
+- **EXIT / STRATEGY / SYMBOL ANALYSIS:** hard-stop and trail performance,
+  strategy telemetry and allocation evidence, and per-symbol outcomes.
+- **THROUGHPUT / RISK HEALTH:** opportunities/hour, qualified/hour,
+  entries/hour, net expectancy, profit factor, and drawdown.
 
 ## 8. Paper Trading Metrics
 

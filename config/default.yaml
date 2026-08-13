@@ -56,7 +56,18 @@ paper:
   loss_cooldown_seconds: 300.0             # LOSS_COOLDOWN_SECONDS; each net loss
   win_cooldown_seconds: 30.0               # WIN_COOLDOWN_SECONDS; shorter than loss
   trail_activation_pct: 0.20               # TRAIL_ACTIVATION_PCT; configured floor
-  trail_distance_pct: 0.20                 # TRAIL_DISTANCE_PCT
+  trail_distance_pct: 0.20                 # TRAIL_DISTANCE_PCT; configured floor
+  # The trail is widened per position from live volatility/spread, never
+  # tightened below the floor and never converted into a fixed take-profit.
+  trail_volatility_multiplier: 1.50        # TRAIL_VOLATILITY_MULTIPLIER
+  trail_spread_multiplier: 2.00            # TRAIL_SPREAD_MULTIPLIER
+  trail_activation_volatility_multiplier: 1.25 # TRAIL_ACTIVATION_VOLATILITY_MULTIPLIER
+  max_trail_distance_pct: 1.25             # MAX_TRAIL_DISTANCE_PCT
+  # A winning trail may re-enter early only after a new, materially stronger,
+  # structurally aligned sequence. Hard-stop cooldowns are never bypassed.
+  material_reentry_confidence_improvement: 0.10 # MATERIAL_REENTRY_CONFIDENCE_IMPROVEMENT
+  min_reentry_market_structure_score: 0.55  # MIN_REENTRY_MARKET_STRUCTURE_SCORE
+  reentry_reference_volatility_pct: 0.30    # REENTRY_REFERENCE_VOLATILITY_PCT
   # Runtime activation is raised above the floor when required so the trail
   # level covers estimated fees/spread/slippage instead of protecting a net loss.
   max_consecutive_losses_per_symbol: 2     # MAX_CONSECUTIVE_LOSSES_PER_SYMBOL

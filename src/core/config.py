@@ -85,6 +85,39 @@ class PaperTradingSettings(BaseSettings):
     trail_distance_pct: float = Field(
         default=0.20, gt=0.0, le=100.0, validation_alias="TRAIL_DISTANCE_PCT"
     )
+    trail_volatility_multiplier: float = Field(
+        default=1.5, ge=0.0, le=10.0, validation_alias="TRAIL_VOLATILITY_MULTIPLIER"
+    )
+    trail_spread_multiplier: float = Field(
+        default=2.0, ge=0.0, le=10.0, validation_alias="TRAIL_SPREAD_MULTIPLIER"
+    )
+    trail_activation_volatility_multiplier: float = Field(
+        default=1.25,
+        ge=0.0,
+        le=10.0,
+        validation_alias="TRAIL_ACTIVATION_VOLATILITY_MULTIPLIER",
+    )
+    max_trail_distance_pct: float = Field(
+        default=1.25, gt=0.0, le=100.0, validation_alias="MAX_TRAIL_DISTANCE_PCT"
+    )
+    material_reentry_confidence_improvement: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        validation_alias="MATERIAL_REENTRY_CONFIDENCE_IMPROVEMENT",
+    )
+    min_reentry_market_structure_score: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        validation_alias="MIN_REENTRY_MARKET_STRUCTURE_SCORE",
+    )
+    reentry_reference_volatility_pct: float = Field(
+        default=0.30,
+        gt=0.0,
+        le=100.0,
+        validation_alias="REENTRY_REFERENCE_VOLATILITY_PCT",
+    )
     max_consecutive_losses_per_symbol: int = Field(
         default=2, ge=1, validation_alias="MAX_CONSECUTIVE_LOSSES_PER_SYMBOL"
     )

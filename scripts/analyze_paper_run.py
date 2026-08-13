@@ -76,6 +76,59 @@ def _slippage_stats(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def _trade_metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
+    """Cost-aware metrics for a database trade subset."""
+    net_values = [_float(row, "net_pnl") for row in rows]
+    gross_values = [_float(row, "gross_pnl") for row in rows]
+    fee_values = [_float(row, "fees") for row in rows]
+    slippage_values = [_float(row, "slippage_cost") for row in rows]
+    wins = [value for value in net_values if value > 0]
+    losses = [value for value in net_values if value <= 0]
+    gross_loss = abs(sum(losses))
+    profit_factor: float | None = sum(wins) / gross_loss if gross_loss > 0 else None
+    mfe = [_float(row, "mfe_pct") for row in rows]
+    mae = [_float(row, "mae_pct") for row in rows]
+    holding = [_holding_seconds(row) for row in rows]
+    return {
+        "trade_count": len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": len(wins) / len(rows) * 100.0 if rows else 0.0,
+        "gross_pnl": sum(gross_values),
+        "fees": sum(fee_values),
+        "slippage": sum(slippage_values),
+        "net_pnl": sum(net_values),
+        "profit_factor": profit_factor,
+        "expectancy": sum(net_values) / len(rows) if rows else 0.0,
+        "average_winner": statistics.mean(wins) if wins else 0.0,
+        "average_loser": statistics.mean(losses) if losses else 0.0,
+        "largest_winner": max(wins) if wins else 0.0,
+        "largest_loser": min(losses) if losses else 0.0,
+        "mfe": {
+            "average_pct": statistics.mean(mfe) if mfe else 0.0,
+            "median_pct": statistics.median(mfe) if mfe else 0.0,
+            "p95_pct": _slippage_stats(mfe)["p95"],
+        },
+        "mae": {
+            "average_pct": statistics.mean(mae) if mae else 0.0,
+            "median_pct": statistics.median(mae) if mae else 0.0,
+            "p95_pct": _slippage_stats(mae)["p95"],
+        },
+        "holding_duration": {
+            "average_seconds": statistics.mean(holding) if holding else 0.0,
+            "median_seconds": statistics.median(holding) if holding else 0.0,
+            "p95_seconds": _slippage_stats(holding)["p95"],
+        },
+    }
+
+
+def _group_metrics(rows: list[sqlite3.Row], field_name: str) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        groups[str(_value(row, field_name, "unknown") or "unknown")].append(row)
+    return {name: _trade_metrics(group) for name, group in sorted(groups.items())}
+
+
 def analyze_database(db_path: str) -> dict[str, Any]:
     path = Path(db_path)
     if not path.exists():
@@ -129,6 +182,33 @@ def analyze_database(db_path: str) -> dict[str, Any]:
         else {}
     )
 
+    funnel_counter_names = (
+        "raw_signals",
+        "valid_signals",
+        "inactive_signals",
+        "opportunities_created",
+        "opportunities_below_score_threshold",
+        "confidence_rejections",
+        "expected_edge_rejections",
+        "cooldown_rejections",
+        "reentry_rejections",
+        "stale_market_rejections",
+        "liquidity_rejections",
+        "spread_rejections",
+        "correlation_rejections",
+        "risk_rejections",
+        "capacity_rejections",
+        "execution_attempts",
+        "successful_entries",
+        "qualified_opportunities",
+        "approved_opportunities",
+        "closed_trades",
+    )
+    funnel = {
+        name: int(runtime_metrics.get(f"funnel_{name}", runtime_metrics.get(name, 0)))
+        for name in funnel_counter_names
+    }
+
     net_values = [_float(trade, "net_pnl") for trade in trades]
     gross_values = [_float(trade, "gross_pnl") for trade in trades]
     fee_values = [_float(trade, "fees") for trade in trades]
@@ -145,6 +225,20 @@ def analyze_database(db_path: str) -> dict[str, Any]:
 
     holding_values = [_holding_seconds(trade) for trade in trades]
     exit_reasons = Counter(str(_value(trade, "exit_reason", "unknown")) for trade in trades)
+    strategy_analysis = _group_metrics(trades, "strategy_id")
+    symbol_analysis = _group_metrics(trades, "symbol")
+    hard_stop_rows = [
+        trade for trade in trades if str(_value(trade, "exit_reason", "")) in {"hard_stop", "stop_loss"}
+    ]
+    trail_rows = [
+        trade for trade in trades if str(_value(trade, "exit_reason", "")) == "trail_hit"
+    ]
+    other_exit_rows = [trade for trade in trades if trade not in hard_stop_rows and trade not in trail_rows]
+    exit_analysis = {
+        "hard_stop": _trade_metrics(hard_stop_rows),
+        "trail_hit": _trade_metrics(trail_rows),
+        "other": _trade_metrics(other_exit_rows),
+    }
     trades_per_symbol = Counter(str(_value(trade, "symbol", "unknown")) for trade in trades)
     pnl_per_symbol: dict[str, float] = defaultdict(float)
     for trade in trades:
@@ -259,6 +353,49 @@ def analyze_database(db_path: str) -> dict[str, Any]:
             "trades_per_symbol": dict(sorted(trades_per_symbol.items())),
             "net_pnl_per_symbol": dict(sorted(pnl_per_symbol.items())),
         },
+        "signal_funnel": {
+            "raw_signals": funnel["raw_signals"],
+            "qualified_signals": funnel["valid_signals"],
+            "inactive_signals": funnel["inactive_signals"],
+            "opportunities": funnel["opportunities_created"],
+            "approved_opportunities": funnel["approved_opportunities"],
+            "entries": funnel["successful_entries"],
+            "closed_trades": funnel["closed_trades"] or trade_count,
+            "counters": funnel,
+        },
+        "trade_performance": _trade_metrics(trades),
+        "exit_analysis": exit_analysis,
+        "strategy_analysis": strategy_analysis,
+        "symbol_analysis": symbol_analysis,
+        "rejection_breakdown": {
+            name: {
+                "count": count,
+                "pct_of_named_rejections": (
+                    count
+                    / max(
+                        1,
+                        sum(
+                            funnel[key]
+                            for key in (
+                                "opportunities_below_score_threshold",
+                                "confidence_rejections",
+                                "expected_edge_rejections",
+                                "cooldown_rejections",
+                                "reentry_rejections",
+                                "stale_market_rejections",
+                                "liquidity_rejections",
+                                "correlation_rejections",
+                                "risk_rejections",
+                                "capacity_rejections",
+                            )
+                        ),
+                    )
+                    * 100.0
+                ),
+            }
+            for name, count in funnel.items()
+            if name.endswith("_rejections") or name == "opportunities_below_score_threshold"
+        },
         "entry_protection": {
             "rejected_entries": int(runtime_metrics.get("rejected_entries", 0)),
             "rejected_cooldown": int(runtime_metrics.get("cooldown_rejections", 0)),
@@ -274,6 +411,8 @@ def analyze_database(db_path: str) -> dict[str, Any]:
             "reentry_attempts_prevented": int(
                 runtime_metrics.get("reentry_attempts_prevented", 0)
             ),
+            "reentry_rejections": int(runtime_metrics.get("reentry_rejections", 0)),
+            "early_reentries_allowed": int(runtime_metrics.get("early_reentries_allowed", 0)),
         },
         "execution": {
             "orders": len(orders),
@@ -337,6 +476,12 @@ def print_report(report: dict[str, Any]) -> None:
     execution = report["execution"]
     health = report["health"]
     integrity = report["integrity"]
+    funnel = report.get("signal_funnel", {})
+    rejection_breakdown = report.get("rejection_breakdown", {})
+    trade_performance = report.get("trade_performance", trading)
+    exits = report.get("exit_analysis", {})
+    strategy_analysis = report.get("strategy_analysis", {})
+    symbol_analysis = report.get("symbol_analysis", {})
 
     print("=" * 78)
     print("  PAPER TRADING SOAK REPORT — DATABASE FACTS ONLY")
@@ -351,6 +496,22 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"  Cash / allocated:      {_money(account['cash'])} / {_money(account['allocated'])}")
     print(f"  Open positions:        {account['open_positions']}")
     print(f"  Max drawdown:          {account['max_drawdown_pct']:.6f}%")
+
+    print("\n[ SIGNAL FUNNEL ]")
+    print(
+        "  Raw → qualified → opportunities → approved → entries → closed: "
+        f"{funnel.get('raw_signals', 0)} → {funnel.get('qualified_signals', 0)} → "
+        f"{funnel.get('opportunities', 0)} → {funnel.get('approved_opportunities', 0)} → "
+        f"{funnel.get('entries', 0)} → {funnel.get('closed_trades', 0)}"
+    )
+    print(f"  Inactive signals:      {funnel.get('inactive_signals', 0)}")
+
+    print("\n[ REJECTION BREAKDOWN ]")
+    for reason, details in sorted(rejection_breakdown.items()):
+        print(
+            f"  {reason}: {details.get('count', 0)} "
+            f"({details.get('pct_of_named_rejections', 0.0):.2f}%)"
+        )
 
     print("\n[ GROSS → COSTS → NET (CLOSED TRADES) ]")
     print(f"  Gross PnL before costs:{_money(costs['gross_pnl_before_costs_closed']):>16}")
@@ -373,6 +534,11 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"  Average win / loss:    {_money(trading['average_win'])} / {_money(trading['average_loss'])}")
     print(f"  Largest win / loss:    {_money(trading['largest_win'])} / {_money(trading['largest_loss'])}")
     print(f"  Avg / median hold:     {trading['average_holding_seconds']:.2f}s / {trading['median_holding_seconds']:.2f}s")
+    print(
+        "  Avg MFE / MAE:         "
+        f"{trade_performance.get('mfe', {}).get('average_pct', 0.0):.4f}% / "
+        f"{trade_performance.get('mae', {}).get('average_pct', 0.0):.4f}%"
+    )
     print(f"  Exit reasons:          {trading['exit_reason_distribution']}")
     print(f"  Trades per symbol:     {trading['trades_per_symbol']}")
 
@@ -383,6 +549,35 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"  Insufficient edge:     {protection['rejected_insufficient_expected_edge']}")
     print(f"  Re-entry prevented:    {protection['reentry_attempts_prevented']}")
     print(f"  Consecutive-loss events:{protection['consecutive_loss_events']:>7}")
+    print(f"  Early re-entries allowed:{protection.get('early_reentries_allowed', 0):>6}")
+
+    print("\n[ EXIT ANALYSIS ]")
+    for reason, metrics in exits.items():
+        print(
+            f"  {reason}: trades={metrics.get('trade_count', 0)} "
+            f"net={_money(float(metrics.get('net_pnl', 0.0)))} "
+            f"expectancy={_money(float(metrics.get('expectancy', 0.0)))} "
+            f"avg MFE/MAE={metrics.get('mfe', {}).get('average_pct', 0.0):.4f}%/"
+            f"{metrics.get('mae', {}).get('average_pct', 0.0):.4f}%"
+        )
+
+    print("\n[ STRATEGY ANALYSIS ]")
+    for strategy_id, metrics in strategy_analysis.items():
+        print(
+            f"  {strategy_id}: trades={metrics.get('trade_count', 0)} "
+            f"win={metrics.get('win_rate_pct', 0.0):.2f}% "
+            f"net={_money(float(metrics.get('net_pnl', 0.0)))} "
+            f"PF={metrics.get('profit_factor', 'N/A')} "
+            f"EV={_money(float(metrics.get('expectancy', 0.0)))}"
+        )
+
+    print("\n[ SYMBOL ANALYSIS ]")
+    for symbol, metrics in symbol_analysis.items():
+        print(
+            f"  {symbol}: trades={metrics.get('trade_count', 0)} "
+            f"net={_money(float(metrics.get('net_pnl', 0.0)))} "
+            f"PF={metrics.get('profit_factor', 'N/A')}"
+        )
 
     print("\n[ EXECUTION ]")
     print(f"  Orders / fills:        {execution['orders']} / {execution['fills']}")

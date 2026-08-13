@@ -41,12 +41,16 @@ class PositionMonitor:
     def register_position(self, pos: PaperPosition) -> None:
         direction = TrailDirection.LONG if pos.direction == "long" else TrailDirection.SHORT
         activation_pct = pos.trail_activation_pct or self.trail_manager.config.activation_pct
+        trail_distance_pct = float(
+            pos.metadata.get("effective_trail_distance_pct", self.trail_manager.config.trail_pct)
+        )
         ts = self.trail_manager.initialize(
             pos.symbol,
             direction,
             pos.entry_price,
             pos.entry_time,
             activation_pct=activation_pct,
+            trail_distance_pct=trail_distance_pct,
         )
         self._trail_states[pos.symbol] = ts
         self._exit_intents.discard(pos.symbol)
@@ -87,6 +91,9 @@ class PositionMonitor:
                 pos.entry_time,
                 activation_pct=(
                     pos.trail_activation_pct or self.trail_manager.config.activation_pct
+                ),
+                trail_distance_pct=float(
+                    pos.metadata.get("effective_trail_distance_pct", self.trail_manager.config.trail_pct)
                 ),
             )
             self._trail_states[sym] = ts
@@ -134,6 +141,7 @@ class PositionMonitor:
             "trail_level": ts.trail_level,
             "activation_price": ts.activation_price,
             "activation_pct": ts.activation_pct,
+            "trail_distance_pct": ts.trail_distance_pct,
             "activated": ts.activated,
             "exit_intent": symbol in self._exit_intents,
         }
@@ -146,6 +154,7 @@ class PositionMonitor:
             direction,
             saved["entry_price"],
             activation_pct=saved.get("activation_pct"),
+            trail_distance_pct=saved.get("trail_distance_pct"),
         )
         ts.peak_price = saved["peak_price"]
         ts.trail_level = saved["trail_level"]

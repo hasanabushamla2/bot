@@ -47,6 +47,7 @@ Scanner → AssetSnapshots → GlobalScanner.scan() → ScannerSignals →
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -172,6 +173,19 @@ class AssetSnapshot:
 
 
 @dataclass
+class ScannerDiagnostics:
+    """Per-scan accounting for scanner filters that previously returned silently."""
+
+    snapshots_received: int = 0
+    class_filtered: int = 0
+    safety_passed: int = 0
+    safety_rejections: Counter[str] = field(default_factory=Counter)
+    below_confidence_threshold: int = 0
+    output_signals: int = 0
+    capped_signals: int = 0
+
+
+@dataclass
 class ScannerSignal:
     """A detected opportunity from ANY asset class with all scoring factors.
 
@@ -235,6 +249,7 @@ class GlobalScanner:
         self._price_history: dict[str, list[float]] = {}
         self._volume_history: dict[str, list[float]] = {}
         self._max_history: int = 100
+        self.last_diagnostics = ScannerDiagnostics()
 
     # ------------------------------------------------------------------
     # Main scan entry point
@@ -251,6 +266,9 @@ class GlobalScanner:
             Ranked list of ScannerSignals (best first), capped at
             max_signals_per_scan.
         """
+        diagnostics = ScannerDiagnostics(snapshots_received=len(snapshots))
+        self.last_diagnostics = diagnostics
+
         # --- Update rolling history ---
         for snap in snapshots:
             self._update_history(snap)
@@ -258,6 +276,7 @@ class GlobalScanner:
         # --- Filter by enabled asset classes ---
         enabled = {ac.value for ac in self.config.enabled_classes}
         class_filtered = [s for s in snapshots if s.asset_class.value in enabled]
+        diagnostics.class_filtered = len(class_filtered)
 
         # --- Safety filter ---
         eligible: list[AssetSnapshot] = []
@@ -265,12 +284,14 @@ class GlobalScanner:
             if self._check_safety(s):
                 eligible.append(s)
             else:
+                diagnostics.safety_rejections[s.safety_rejection_reason or "unknown"] += 1
                 logger.debug(
                     "scanner_safety_rejected",
                     symbol=s.symbol,
                     asset_class=s.asset_class.value,
                     reason=s.safety_rejection_reason,
                 )
+        diagnostics.safety_passed = len(eligible)
 
         # --- Compute scores ---
         signals: list[ScannerSignal] = []
@@ -278,12 +299,17 @@ class GlobalScanner:
             signal = self._compute_scores(snap)
             if signal.confidence >= self.config.min_signal_confidence:
                 signals.append(signal)
+            else:
+                diagnostics.below_confidence_threshold += 1
 
         # --- Rank by composite score (asset-class agnostic) ---
         signals.sort(key=lambda s: s.composite_score, reverse=True)
 
         # --- Cap ---
-        return signals[: self.config.max_signals_per_scan]
+        diagnostics.capped_signals = max(0, len(signals) - self.config.max_signals_per_scan)
+        result = signals[: self.config.max_signals_per_scan]
+        diagnostics.output_signals = len(result)
+        return result
 
     # ------------------------------------------------------------------
     # Safety filter

@@ -43,11 +43,9 @@ async def main() -> None:
     print("=" * 60)
 
     result = await orch.start(duration_seconds=args.duration)
-    print("\n" + "=" * 60)
-    print("  FINAL REPORT")
-    for k, v in result.items():
-        print(f"  {k}: {v}")
-    print("=" * 60)
+    from src.paper.reporting import format_session_report
+
+    print("\n" + format_session_report(result))
 
 
 if __name__ == "__main__":

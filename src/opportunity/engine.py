@@ -73,11 +73,17 @@ class OpportunityEngine:
         min_net_return: float = 0.002,
         min_fill_probability: float = 0.5,
         max_correlation: float = 0.7,
+        min_final_score: float = 0.0,
     ) -> None:
         self.min_confidence = min_confidence
         self.min_net_return = min_net_return  # R7: decimal fraction
         self.min_fill_probability = min_fill_probability
         self.max_correlation = max_correlation
+        # A score floor is explicit for telemetry.  The adaptive pre-entry
+        # quality gate supplies the richer dynamic quality threshold later in
+        # the paper pipeline; this static floor only rejects non-positive
+        # opportunity economics/scores.
+        self.min_final_score = min_final_score
         self._strategy_performance: dict[str, float] = {}
 
     def update_strategy_performance(self, strategy_id: str, expectancy: float) -> None:
@@ -93,7 +99,7 @@ class OpportunityEngine:
 
         if signal.confidence < self.min_confidence:
             opp.status = OpportunityStatus.REJECTED
-            opp.rejection_reason = RejectionReason.OTHER
+            opp.rejection_reason = RejectionReason.INSUFFICIENT_CONFIDENCE
             return opp
 
         gross = signal.estimated_return or 0.0
@@ -125,12 +131,29 @@ class OpportunityEngine:
         )
         opp.score = score
 
-        # R7: net_return (decimal fraction) vs min_net_return (also decimal fraction)
+        # Keep the expected-edge formula explicit and auditable.  ``net`` is
+        # after modeled fees/spread/slippage; the configured minimum is the
+        # safety buffer that must remain after those costs.
+        expected_net_after_buffer = score.net_return - self.min_net_return
+        opp.metadata.update({
+            "expected_gross_edge_fraction": gross,
+            "estimated_fee_fraction": fees,
+            "estimated_spread_cost_fraction": spread,
+            "estimated_slippage_fraction": slippage,
+            "estimated_round_trip_cost_fraction": fees + spread + slippage,
+            "safety_buffer_fraction": self.min_net_return,
+            "expected_net_edge_fraction": expected_net_after_buffer,
+        })
         if score.net_return < self.min_net_return:
             opp.status = OpportunityStatus.REJECTED
             opp.rejection_reason = RejectionReason.INSUFFICIENT_EXPECTED_EDGE
-            opp.metadata["estimated_round_trip_cost_fraction"] = fees + spread + slippage
             opp.metadata["expected_edge_over_cost"] = score.net_return
+            return opp
+
+        if score.final_score < self.min_final_score:
+            opp.status = OpportunityStatus.REJECTED
+            opp.rejection_reason = RejectionReason.LOW_SCORE
+            opp.metadata["score_threshold"] = self.min_final_score
             return opp
 
         if score.fill_probability < self.min_fill_probability:

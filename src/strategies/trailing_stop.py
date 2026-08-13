@@ -40,8 +40,8 @@ class TrailConfig:
     """Configuration for one trailing stop instance."""
 
     algorithm: TrailAlgorithm = TrailAlgorithm.PERCENTAGE
-    trail_pct: float = 0.20  # Distance from peak (0.20% trail (FINAL))
-    activation_pct: float = 0.20  # Profit needed before trail activates (0.20% FINAL)
+    trail_pct: float = 0.20  # Distance from peak (0.20% trail floor)
+    activation_pct: float = 0.20  # Profit needed before trail activates (floor)
 
     # ATR parameters
     atr_period: int = 14
@@ -70,6 +70,7 @@ class TrailState:
     activated: bool = False  # Has trail been activated?
     activation_price: float = 0.0  # Price at which trail activates
     activation_pct: float = 0.0  # Effective activation, including the fee-aware floor
+    trail_distance_pct: float = 0.0  # Effective per-position distance from peak
 
     # Metrics (recorded at exit)
     entry_time: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -86,6 +87,60 @@ class TrailState:
     @property
     def is_active(self) -> bool:
         return self.exit_price is None
+
+
+@dataclass(frozen=True)
+class VolatilityAwareTrailParameters:
+    """Effective per-position trail settings derived from live market noise."""
+
+    trail_distance_pct: float
+    activation_pct: float
+    volatility_component_pct: float
+    spread_component_pct: float
+
+
+def compute_volatility_aware_trail(
+    *,
+    base_trail_distance_pct: float,
+    base_activation_pct: float,
+    volatility_pct: float,
+    spread_bps: float,
+    round_trip_cost_fraction: float,
+    volatility_multiplier: float = 1.5,
+    spread_multiplier: float = 2.0,
+    activation_volatility_multiplier: float = 1.25,
+    max_trail_distance_pct: float = 1.25,
+) -> VolatilityAwareTrailParameters:
+    """Make a trail wide enough for current noise while retaining a hard cap.
+
+    ``volatility_pct`` and the result are percent units (``0.30`` means
+    0.30%).  Costs use decimal-fraction units.  The function raises neither
+    stops nor position sizing; it only prevents an otherwise healthy winner
+    from being closed by a normal volatile retracement.
+    """
+    safe_base_distance = max(0.0, base_trail_distance_pct)
+    safe_base_activation = max(0.0, base_activation_pct)
+    vol_component = max(0.0, volatility_pct) * max(0.0, volatility_multiplier)
+    spread_component = max(0.0, spread_bps) / 100.0 * max(0.0, spread_multiplier)
+    raw_distance = max(safe_base_distance, vol_component, spread_component)
+    effective_distance = min(max(0.0, max_trail_distance_pct), raw_distance)
+
+    # The activation floor protects the economics of the trail.  The exact
+    # post-cost breakeven price is calculated by the caller against its fill
+    # model; this component ensures volatile markets do not activate too soon.
+    cost_component = max(0.0, round_trip_cost_fraction) * 100.0
+    effective_activation = max(
+        safe_base_activation,
+        cost_component,
+        max(0.0, volatility_pct) * max(0.0, activation_volatility_multiplier),
+        spread_component,
+    )
+    return VolatilityAwareTrailParameters(
+        trail_distance_pct=effective_distance,
+        activation_pct=effective_activation,
+        volatility_component_pct=vol_component,
+        spread_component_pct=spread_component,
+    )
 
 
 class TrailingStopManager:
@@ -114,6 +169,7 @@ class TrailingStopManager:
         entry_price: float,
         entry_time: datetime | None = None,
         activation_pct: float | None = None,
+        trail_distance_pct: float | None = None,
     ) -> TrailState:
         """Create a new trail state for an opening position.
 
@@ -125,6 +181,9 @@ class TrailingStopManager:
         effective_activation_pct = (
             cfg.activation_pct if activation_pct is None else max(0.0, activation_pct)
         )
+        effective_trail_distance_pct = (
+            cfg.trail_pct if trail_distance_pct is None else max(0.0, trail_distance_pct)
+        )
         state = TrailState(
             symbol=symbol,
             direction=direction,
@@ -134,6 +193,7 @@ class TrailingStopManager:
             trail_level=entry_price,  # No trail until activated
             entry_time=entry_time or datetime.now(UTC),
             activation_pct=effective_activation_pct,
+            trail_distance_pct=effective_trail_distance_pct,
         )
 
         # Compute activation price.  PositionMonitor may provide a higher,
@@ -266,8 +326,12 @@ class TrailingStopManager:
             return self._trail_percentage(state)
 
     def _trail_percentage(self, state: TrailState) -> float:
-        """Percentage-based trail: peak * (1 - trail_pct/100)."""
-        pct = self.config.trailing_delta  # 0.002 = 0.20%
+        """Percentage-based trail using the per-position effective distance."""
+        pct = (
+            state.trail_distance_pct / 100.0
+            if state.trail_distance_pct > 0.0
+            else self.config.trailing_delta
+        )
         if state.direction == TrailDirection.LONG:
             return state.peak_price * (1.0 - pct)
         else:

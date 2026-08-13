@@ -27,6 +27,27 @@ class RoundTripCostEstimate:
 
 
 @dataclass
+class ExpectedNetEdgeEstimate:
+    """Explicit pre-entry expected-edge calculation, net of all modeled costs."""
+
+    expected_gross_edge_fraction: float = 0.0
+    expected_gross_edge_usd: float = 0.0
+    estimated_entry_fee: float = 0.0
+    estimated_exit_fee: float = 0.0
+    estimated_spread_cost: float = 0.0
+    expected_slippage: float = 0.0
+    safety_buffer_fraction: float = 0.0
+    safety_buffer_usd: float = 0.0
+    expected_net_edge_fraction: float = 0.0
+    expected_net_edge_usd: float = 0.0
+    costs: RoundTripCostEstimate = field(default_factory=RoundTripCostEstimate)
+
+    @property
+    def is_positive_after_costs(self) -> bool:
+        return self.expected_net_edge_fraction > 0.0
+
+
+@dataclass
 class PaperFillResult:
     symbol: str = ""
     side: str = ""
@@ -99,6 +120,45 @@ class PaperExecutionEngine:
             estimated_round_trip_cost_fraction=(total / notional if notional > 0 else 0.0),
             entry_fill_price=entry_fill,
             exit_fill_price=exit_fill,
+        )
+
+    def estimate_expected_net_edge(
+        self,
+        quantity: float,
+        entry_reference_price: float,
+        exit_reference_price: float,
+        expected_gross_edge_fraction: float,
+        safety_buffer_fraction: float = 0.0,
+    ) -> ExpectedNetEdgeEstimate:
+        """Calculate expected net edge before an entry is sent.
+
+        The gross edge is a strategy estimate in decimal-fraction units.  Fees,
+        bid/ask crossing, modeled adverse slippage, and a separately visible
+        safety buffer are all subtracted.  The method deliberately does not
+        infer a bullish return from the current book; callers must supply an
+        independently generated expected gross edge.
+        """
+        costs = self.estimate_round_trip_cost(
+            quantity, entry_reference_price, exit_reference_price
+        )
+        gross_fraction = max(0.0, expected_gross_edge_fraction)
+        safety_fraction = max(0.0, safety_buffer_fraction)
+        gross_usd = costs.notional * gross_fraction
+        safety_usd = costs.notional * safety_fraction
+        net_usd = gross_usd - costs.estimated_round_trip_cost - safety_usd
+        net_fraction = net_usd / costs.notional if costs.notional > 0 else -safety_fraction
+        return ExpectedNetEdgeEstimate(
+            expected_gross_edge_fraction=gross_fraction,
+            expected_gross_edge_usd=gross_usd,
+            estimated_entry_fee=costs.estimated_entry_fee,
+            estimated_exit_fee=costs.estimated_exit_fee,
+            estimated_spread_cost=costs.estimated_spread_cost,
+            expected_slippage=costs.estimated_slippage,
+            safety_buffer_fraction=safety_fraction,
+            safety_buffer_usd=safety_usd,
+            expected_net_edge_fraction=net_fraction,
+            expected_net_edge_usd=net_usd,
+            costs=costs,
         )
 
     # ---- BLOCKER 5: Depth-walk execution ----
