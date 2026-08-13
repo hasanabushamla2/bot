@@ -130,6 +130,36 @@ class PaperTradingSettings(BaseSettings):
     min_expected_edge_over_cost: float = Field(
         default=0.001, ge=0.0, le=1.0, validation_alias="MIN_EXPECTED_EDGE_OVER_COST"
     )
+    # Bounded sizing enhancement.  It is evaluated only after opportunity,
+    # risk, liquidity, and expected-net-edge gates; it cannot exceed the
+    # existing per-position risk cap.
+    high_conviction_sizing_enabled: bool = Field(
+        default=True, validation_alias="HIGH_CONVICTION_SIZING_ENABLED"
+    )
+    high_conviction_min_confidence: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        validation_alias="HIGH_CONVICTION_MIN_CONFIDENCE",
+    )
+    high_conviction_min_quality_score: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        validation_alias="HIGH_CONVICTION_MIN_QUALITY_SCORE",
+    )
+    high_conviction_min_net_edge_fraction: float = Field(
+        default=0.0015,
+        ge=0.0,
+        le=1.0,
+        validation_alias="HIGH_CONVICTION_MIN_NET_EDGE_FRACTION",
+    )
+    high_conviction_max_multiplier: float = Field(
+        default=4.0,
+        ge=1.0,
+        le=4.0,
+        validation_alias="HIGH_CONVICTION_MAX_MULTIPLIER",
+    )
 
     # The paper fill model.  These remain realistic rather than being relaxed
     # for a short soak test.

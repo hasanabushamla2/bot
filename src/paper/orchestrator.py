@@ -65,6 +65,7 @@ from src.paper.reporting import exit_analysis, finite_report_value, grouped_trad
 from src.paper.telemetry import SignalFunnelTelemetry
 from src.portfolio.allocator import AllocatorConfig, CapitalAllocator, PortfolioState
 from src.portfolio.capacity import PositionCapacity
+from src.portfolio.conviction_sizing import ConvictionSizer, ConvictionSizingConfig
 from src.portfolio.capital_tiers import CapitalTierConfig, CapitalTierManager
 from src.portfolio.liquidity import LiquidityAnalyzer
 from src.portfolio.markets import AssetQualityFilter, QualityFilterConfig
@@ -199,6 +200,17 @@ class PaperTradingOrchestrator:
         self.risk_engine = RiskEngine()
         self.tier_manager = CapitalTierManager(CapitalTierConfig())
         self.allocator = CapitalAllocator(AllocatorConfig())
+        self.conviction_sizer = ConvictionSizer(
+            ConvictionSizingConfig(
+                enabled=self._paper_config.high_conviction_sizing_enabled,
+                min_confidence=self._paper_config.high_conviction_min_confidence,
+                min_quality_score=self._paper_config.high_conviction_min_quality_score,
+                min_net_edge_fraction=(
+                    self._paper_config.high_conviction_min_net_edge_fraction
+                ),
+                max_multiplier=self._paper_config.high_conviction_max_multiplier,
+            )
+        )
         self.liquidity = LiquidityAnalyzer()
         self.account = PaperAccount(initial_balance=initial_balance)
         self.paper_exec = PaperExecutionEngine(
@@ -1608,7 +1620,45 @@ class PaperTradingOrchestrator:
                 self._record_entry_rejection(reason, strategy_id=strategy_id, symbol=sym)
                 continue
 
-            allocated_capital = decisions[0].allocated_capital * allocation_multiplier
+            try:
+                preliminary_net_edge = float(
+                    opp.metadata.get(
+                        "expected_net_edge_fraction",
+                        opp.score.net_return - self._paper_config.min_expected_edge_over_cost,
+                    )
+                )
+                entry_quality_score = float(quality_metadata.get("score", 0.0))
+            except (TypeError, ValueError):
+                preliminary_net_edge = -1.0
+                entry_quality_score = 0.0
+            conviction_sizing = self.conviction_sizer.assess(
+                confidence=opp.signal.confidence,
+                entry_quality_score=entry_quality_score,
+                expected_net_edge_fraction=preliminary_net_edge,
+            )
+            base_allocation = decisions[0].allocated_capital * allocation_multiplier
+            # This is an increase inside already-approved caps only.  It may
+            # never exceed RiskEngine's current per-position ceiling, the
+            # allocator's single-position percentage, or the cash safety cap.
+            existing_position_cap = min(
+                risk.max_position_size,
+                self.account.state.cash * 0.2,
+                self.account.state.equity
+                * self.allocator.config.max_single_position_pct
+                / 100.0,
+            )
+            allocated_capital = min(
+                base_allocation * conviction_sizing.multiplier,
+                existing_position_cap,
+            )
+            decisions[0].allocated_capital = allocated_capital
+            decisions[0].metadata.update({
+                "conviction_sizing_multiplier": conviction_sizing.multiplier,
+                "conviction_sizing_reason": conviction_sizing.reason,
+                "conviction_confidence_component": conviction_sizing.confidence_component,
+                "conviction_quality_component": conviction_sizing.quality_component,
+                "conviction_edge_component": conviction_sizing.edge_component,
+            })
             if allocated_capital < 50.0:
                 self._record_entry_rejection("minimum_notional", strategy_id=strategy_id, symbol=sym)
                 continue
@@ -1676,6 +1726,8 @@ class PaperTradingOrchestrator:
                 "expected_net_edge_fraction": expected_edge.expected_net_edge_fraction,
                 "expected_net_edge_usd": expected_edge.expected_net_edge_usd,
                 "strategy_allocation_multiplier": allocation_multiplier,
+                "conviction_sizing_multiplier": conviction_sizing.multiplier,
+                "conviction_sizing_reason": conviction_sizing.reason,
             })
 
             # ── 8. ORDER CREATION & PAPER EXECUTION ──
@@ -1820,6 +1872,11 @@ class PaperTradingOrchestrator:
                     "trail_volatility_component_pct": trail_params.volatility_component_pct,
                     "trail_spread_component_pct": trail_params.spread_component_pct,
                     "strategy_allocation_multiplier": allocation_multiplier,
+                    "conviction_sizing_multiplier": conviction_sizing.multiplier,
+                    "conviction_sizing_reason": conviction_sizing.reason,
+                    "conviction_confidence_component": conviction_sizing.confidence_component,
+                    "conviction_quality_component": conviction_sizing.quality_component,
+                    "conviction_edge_component": conviction_sizing.edge_component,
                 },
             )
             if not pos:

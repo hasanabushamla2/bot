@@ -74,6 +74,13 @@ paper:
   symbol_lockout_seconds: 1800.0            # SYMBOL_LOCKOUT_SECONDS; temporary
   symbol_loss_streak_reset_seconds: 21600.0 # SYMBOL_LOSS_STREAK_RESET_SECONDS
   min_expected_edge_over_cost: 0.001        # MIN_EXPECTED_EDGE_OVER_COST (10 bps)
+  # Uses more of the existing 10%-of-equity per-position cap only when
+  # confidence, normalized entry quality, and net edge all agree.
+  high_conviction_sizing_enabled: true       # HIGH_CONVICTION_SIZING_ENABLED
+  high_conviction_min_confidence: 0.72       # HIGH_CONVICTION_MIN_CONFIDENCE
+  high_conviction_min_quality_score: 0.70    # HIGH_CONVICTION_MIN_QUALITY_SCORE
+  high_conviction_min_net_edge_fraction: 0.0015 # HIGH_CONVICTION_MIN_NET_EDGE_FRACTION
+  high_conviction_max_multiplier: 4.0        # HIGH_CONVICTION_MAX_MULTIPLIER; bounded by risk cap
   taker_fee: 0.001                          # PAPER_TAKER_FEE (0.10% each fill)
   maker_fee: 0.001                          # PAPER_MAKER_FEE
   slippage_bps: 5.0                        # PAPER_SLIPPAGE_BPS each fill

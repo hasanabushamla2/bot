@@ -150,6 +150,11 @@ strategy is profitable.
 | `SYMBOL_LOCKOUT_SECONDS` | `1800` | Temporary lockout after the threshold |
 | `SYMBOL_LOSS_STREAK_RESET_SECONDS` | `21600` | Inactivity interval that decays a loss streak |
 | `MIN_EXPECTED_EDGE_OVER_COST` | `0.001` | Required expected-return margin over estimated round-trip cost |
+| `HIGH_CONVICTION_SIZING_ENABLED` | `true` | Enables bounded quality/edge-weighted sizing inside existing risk caps |
+| `HIGH_CONVICTION_MIN_CONFIDENCE` | `0.72` | Minimum signal confidence before a position may exceed the base allocation |
+| `HIGH_CONVICTION_MIN_QUALITY_SCORE` | `0.70` | Minimum normalized entry-quality score before a position may exceed base allocation |
+| `HIGH_CONVICTION_MIN_NET_EDGE_FRACTION` | `0.0015` | Minimum net edge after costs and safety buffer for enhanced sizing |
+| `HIGH_CONVICTION_MAX_MULTIPLIER` | `4.0` | Maximum base-allocation multiplier; still capped by max single position / exposure controls |
 | `PAPER_TAKER_FEE` | `0.001` | Fee rate on each simulated market fill |
 | `PAPER_MAKER_FEE` | `0.001` | Maker fee setting (market path currently uses taker rate) |
 | `PAPER_SLIPPAGE_BPS` | `5.0` | Adverse modeled slippage applied on each side |
