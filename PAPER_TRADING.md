@@ -160,6 +160,22 @@ has been observed false and subsequently becomes valid again. Explicit stable
 `signal_id` values from event-driven strategy plugins are also supported.
 Cooldown and signal-consumption state are persisted in the soak database.
 
+### Liquid-alt strategy suite
+
+The paper runner uses a regime-aware long-only spot strategy portfolio rather
+than treating every strategy signal as a separate order. Its additional modules
+are:
+
+- `liquid_alt_trend_v1`: multi-horizon trend continuation in a liquid uptrend.
+- `pullback_continuation_v1`: modest pullbacks with renewed order-flow support.
+- `range_mean_reversion_v1`: cost-aware mean reversion only in a classified
+  range, never as a default high-turnover scalp.
+
+The ensemble selects one compatible long candidate per symbol. Existing
+`breakout_v1`, `momentum_v1`, `order_flow_v1`, and the global scanner remain
+separate inputs. The selector does not alter leverage, hard stops, maximum
+exposure, or concurrent-position limits.
+
 ### Adaptive re-entry and entry quality
 
 A losing hard-stop is never bypassed: its cooldown is scaled from realized loss

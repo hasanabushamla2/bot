@@ -76,8 +76,12 @@ from src.risk.strategy_risk import StrategyRiskConfig, StrategyRiskManager
 from src.risk.symbol_risk import ReentryContext, SymbolRiskConfig, SymbolRiskManager
 from src.scanner.global_scanner import AssetClass, AssetSnapshot, GlobalScanner
 from src.strategies.breakout_strategy import BreakoutStrategy
+from src.strategies.ensemble import StrategyEnsembleSelector
+from src.strategies.liquid_alt_trend_strategy import LiquidAltTrendStrategy
 from src.strategies.momentum_strategy import MomentumStrategy
 from src.strategies.order_flow_strategy import OrderFlowStrategy
+from src.strategies.pullback_continuation_strategy import PullbackContinuationStrategy
+from src.strategies.range_mean_reversion_strategy import RangeMeanReversionStrategy
 from src.strategies.registry import StrategyRegistry
 from src.strategies.trailing_stop import TrailConfig, compute_volatility_aware_trail
 
@@ -213,6 +217,7 @@ class PaperTradingOrchestrator:
         self.analytics = AnalyticsTracker()
         self.signal_guard = EntrySignalGuard()
         self.entry_quality = EntryQualityGate()
+        self.strategy_selector = StrategyEnsembleSelector()
         self.funnel = SignalFunnelTelemetry()
 
         # Engineering Defect Fix Components
@@ -351,7 +356,14 @@ class PaperTradingOrchestrator:
         self._persist.start_session(session_id, self._get_commit_sha())
         self._restore_state()
 
-        for strat in [MomentumStrategy(), BreakoutStrategy(), OrderFlowStrategy()]:
+        for strat in [
+            MomentumStrategy(),
+            BreakoutStrategy(),
+            OrderFlowStrategy(),
+            LiquidAltTrendStrategy(),
+            PullbackContinuationStrategy(),
+            RangeMeanReversionStrategy(),
+        ]:
             self.registry.register(strat)
         await self.registry.initialize_all()
 
@@ -1356,7 +1368,18 @@ class PaperTradingOrchestrator:
         # decisions were already counted as inactive above, rather than being
         # conflated with a raw signal.
         self.funnel.increment("raw_signals", len(strategy_signals))
-        strategy_signals = self.signal_guard.observe_cycle(strategy_signals, evaluated_signal_keys)
+        ensemble_selection = self.strategy_selector.select(
+            strategy_signals, self.features.get
+        )
+        for discarded in ensemble_selection.rejected:
+            self._record_inactive_signal(
+                discarded.reason,
+                discarded.signal.strategy_id,
+                discarded.signal.symbol,
+            )
+        strategy_signals = self.signal_guard.observe_cycle(
+            ensemble_selection.selected, evaluated_signal_keys
+        )
         valid_signals: list[Any] = []
         for signal in strategy_signals:
             is_valid, invalid_reason = self._valid_signal(signal)
