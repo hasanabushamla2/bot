@@ -24,8 +24,8 @@ def test_aggressive_paper_profile_uses_full_balance_without_leverage(tmp_path) -
     assert orchestrator.allocator.config.max_single_exchange_pct == 100.0
     assert orchestrator.tier_manager.config.active_capital_pct == 100.0
     assert orchestrator.tier_manager.config.slots_level_2 == 20
-    assert orchestrator.opportunity_engine.min_confidence == 0.65
-    assert orchestrator.entry_quality.config.min_quality_score == 0.72
+    assert orchestrator.opportunity_engine.min_confidence == 0.58
+    assert orchestrator.entry_quality.config.min_quality_score == 0.64
     assert orchestrator.liquidity_gate.config.min_top_book_notional == 100.0
     assert orchestrator.liquidity_gate.config.max_spread_bps == 25.0
     assert orchestrator.strategy_risk.config.max_strategy_consecutive_losses == 2

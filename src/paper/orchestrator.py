@@ -109,7 +109,7 @@ def _reward_risk_is_acceptable(
     expected_gross_edge_fraction: float,
     round_trip_cost_fraction: float,
     hard_stop_pct: float,
-    minimum_reward_risk_ratio: float = 1.20,
+    minimum_reward_risk_ratio: float = 1.05,
 ) -> bool:
     """Require estimated gross reward to exceed stop plus modeled costs."""
     effective_loss_fraction = max(0.0, hard_stop_pct) / 100.0 + max(
@@ -223,7 +223,7 @@ class PaperTradingOrchestrator:
         self.registry = StrategyRegistry()
         self._paper_config = get_settings().paper
         self.opportunity_engine = OpportunityEngine(
-            min_confidence=0.65 if aggressive_paper else 0.5,
+            min_confidence=0.58 if aggressive_paper else 0.5,
             min_net_return=self._paper_config.min_expected_edge_over_cost,
         )
         self.risk_engine = RiskEngine()
@@ -284,12 +284,12 @@ class PaperTradingOrchestrator:
         self.signal_guard = EntrySignalGuard()
         quality_config = (
             EntryQualityConfig(
-                min_quality_score=0.72,
-                min_normalized_momentum=0.55,
-                min_signal_persistence_observations=3,
-                strong_first_observation_confidence=0.90,
-                max_reversal_risk=0.45,
-                max_dynamic_score_uplift=0.08,
+                min_quality_score=0.64,
+                min_normalized_momentum=0.40,
+                min_signal_persistence_observations=2,
+                strong_first_observation_confidence=0.85,
+                max_reversal_risk=0.55,
+                max_dynamic_score_uplift=0.10,
             )
             if aggressive_paper
             else EntryQualityConfig()
@@ -1825,7 +1825,7 @@ class PaperTradingOrchestrator:
             ):
                 # The previous run accepted ~0.50% gross reward while modeled
                 # costs plus the stop exceeded ~0.60%, producing poor payoff
-                # even before prediction error. Quality-first mode forbids it.
+                # even before prediction error. Balanced mode still forbids it.
                 self._record_entry_rejection("reward_risk", strategy_id=strategy_id, symbol=sym)
                 continue
 
