@@ -97,6 +97,14 @@ LEASE_HEARTBEAT_SEC = 15.0
 LEASE_EXPIRY_SEC = 45.0
 
 
+def _aggressive_paper_allocation(
+    cash: float, max_position: float, remaining_slots: int, remaining_candidates: int
+) -> tuple[float, int]:
+    """Split paper cash across candidates that can fill the remaining slots."""
+    divisor = max(1, min(remaining_slots, remaining_candidates))
+    return min(max_position, cash / divisor), divisor
+
+
 def _parse_iso_or_now(s: str) -> datetime:
     """Parse ISO timestamp string, fall back to now if unparseable."""
     if not s:
@@ -210,7 +218,11 @@ class PaperTradingOrchestrator:
             # slots without leverage or bypassing quality/liquidity/risk checks.
             slot_count = 20
             self.risk_engine.max_total_exposure_usd = initial_balance
-            self.risk_engine.max_position_size_usd = initial_balance / 10.0
+            # With only a few qualified symbols, divide the paper balance among
+            # them instead of waiting for all 20 slots to fill. Two independent
+            # symbols can therefore receive 50% each; one symbol alone cannot
+            # consume the whole account.
+            self.risk_engine.max_position_size_usd = initial_balance / 2.0
             self.risk_engine.max_positions_per_strategy = slot_count
             tier_config = CapitalTierConfig(
                 slots_level_1=slot_count, slots_level_2=slot_count,
@@ -218,9 +230,9 @@ class PaperTradingOrchestrator:
                 active_capital_pct=100.0, max_tier_c_slot_pct=50.0,
             )
             allocator_config = AllocatorConfig(
-                reserve_pct=0.0, max_single_position_pct=10.0,
-                max_single_asset_pct=10.0, max_single_strategy_pct=100.0,
-                max_single_exchange_pct=100.0, max_correlated_exposure_pct=40.0,
+                reserve_pct=0.0, max_single_position_pct=50.0,
+                max_single_asset_pct=50.0, max_single_strategy_pct=100.0,
+                max_single_exchange_pct=100.0, max_correlated_exposure_pct=60.0,
                 max_positions_limit=slot_count, risk_budget_fraction=1.0,
             )
         else:
@@ -1556,7 +1568,7 @@ class PaperTradingOrchestrator:
         )
 
         opened_this_tick = 0
-        for opp in opportunities:
+        for opportunity_index, opp in enumerate(opportunities):
             strategy_id = opp.signal.strategy_id
             sym = opp.signal.symbol or "unknown"
             if opened_this_tick >= available:
@@ -1614,15 +1626,22 @@ class PaperTradingOrchestrator:
                 continue
 
             if self._aggressive_paper:
-                # Fill the remaining simulated slot budget evenly. If all 20
-                # qualified slots fill, this targets 100% paper utilization;
-                # downstream liquidity/execution gates may still reduce it.
+                # Divide cash by the opportunities that can actually be opened
+                # now, not by a fixed target of 20. This deploys the full paper
+                # balance when enough candidates pass all downstream gates.
                 remaining_slots = max(1, available - opened_this_tick)
-                opp.signal.required_capital = min(
+                remaining_candidates = max(1, len(opportunities) - opportunity_index)
+                target_capital, allocation_divisor = _aggressive_paper_allocation(
+                    self.account.state.cash,
                     self.risk_engine.max_position_size_usd,
-                    self.account.state.cash / remaining_slots,
+                    remaining_slots,
+                    remaining_candidates,
                 )
-                opp.signal.metadata["paper_utilization_target"] = 1.0
+                opp.signal.required_capital = target_capital
+                opp.signal.metadata.update({
+                    "paper_utilization_target": 1.0,
+                    "paper_allocation_divisor": allocation_divisor,
+                })
 
             self._risk_assessments += 1
             risk = self.risk_engine.assess(opp)

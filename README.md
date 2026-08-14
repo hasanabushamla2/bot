@@ -142,7 +142,8 @@ MIT
 
 The KuCoin public-data runner is simulation-only and defaults to the explicit
 `aggressive-paper` profile. It can deploy up to 100% of the simulated balance,
-but distributes exposure across up to 20 independently gated positions. It
+dividing available cash by the number of currently qualified opportunities (up
+to 20 positions, with at least two symbols required for full deployment). It
 keeps 1x spot-only execution, hard stops, liquidity/cost checks, correlation
 controls, and the circuit breaker enabled.
 
