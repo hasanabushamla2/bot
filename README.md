@@ -158,6 +158,13 @@ python scripts/run_live_paper.py --duration 3600 --max-symbols 0 --fresh-db
 python scripts/run_live_paper.py --profile safe --duration 3600 --fresh-db
 ```
 
+The aggressive-paper profile is quality-first: it requires at least 0.65 signal
+confidence, stronger normalized entry confirmation, and estimated gross reward
+of at least 1.2 times the hard stop plus modeled round-trip costs. Its pre-screen
+allows shallower altcoin books to reach execution-aware sizing, where quantity
+is reduced to safe visible depth. Two consecutive losses pause a strategy for
+one hour.
+
 A larger universe and faster two-second scan cadence create more opportunities;
 they do not guarantee more trades, a particular win rate, or profitability.
 Evaluate results over multiple market regimes using the persisted paper database

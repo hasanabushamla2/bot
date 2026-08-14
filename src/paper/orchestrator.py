@@ -77,7 +77,7 @@ from src.portfolio.markets import AssetQualityFilter, QualityFilterConfig
 from src.portfolio.universe import UniverseConfig, UniverseManager
 from src.risk.engine import RiskEngine
 from src.risk.entry_guard import EntrySignalGuard
-from src.risk.entry_quality import EntryQualityGate
+from src.risk.entry_quality import EntryQualityConfig, EntryQualityGate
 from src.risk.strategy_risk import StrategyRiskConfig, StrategyRiskManager
 from src.risk.symbol_risk import ReentryContext, SymbolRiskConfig, SymbolRiskManager
 from src.scanner.global_scanner import AssetClass, AssetSnapshot, GlobalScanner
@@ -103,6 +103,19 @@ def _aggressive_paper_allocation(
     """Split paper cash across candidates that can fill the remaining slots."""
     divisor = max(1, min(remaining_slots, remaining_candidates))
     return min(max_position, cash / divisor), divisor
+
+
+def _reward_risk_is_acceptable(
+    expected_gross_edge_fraction: float,
+    round_trip_cost_fraction: float,
+    hard_stop_pct: float,
+    minimum_reward_risk_ratio: float = 1.20,
+) -> bool:
+    """Require estimated gross reward to exceed stop plus modeled costs."""
+    effective_loss_fraction = max(0.0, hard_stop_pct) / 100.0 + max(
+        0.0, round_trip_cost_fraction
+    )
+    return expected_gross_edge_fraction >= effective_loss_fraction * minimum_reward_risk_ratio
 
 
 def _parse_iso_or_now(s: str) -> datetime:
@@ -210,7 +223,8 @@ class PaperTradingOrchestrator:
         self.registry = StrategyRegistry()
         self._paper_config = get_settings().paper
         self.opportunity_engine = OpportunityEngine(
-            min_net_return=self._paper_config.min_expected_edge_over_cost
+            min_confidence=0.65 if aggressive_paper else 0.5,
+            min_net_return=self._paper_config.min_expected_edge_over_cost,
         )
         self.risk_engine = RiskEngine()
         if aggressive_paper:
@@ -268,12 +282,37 @@ class PaperTradingOrchestrator:
         self.monitor = PositionMonitor(self.account, trail_config=trail_config)
         self.analytics = AnalyticsTracker()
         self.signal_guard = EntrySignalGuard()
-        self.entry_quality = EntryQualityGate()
+        quality_config = (
+            EntryQualityConfig(
+                min_quality_score=0.72,
+                min_normalized_momentum=0.55,
+                min_signal_persistence_observations=3,
+                strong_first_observation_confidence=0.90,
+                max_reversal_risk=0.45,
+                max_dynamic_score_uplift=0.08,
+            )
+            if aggressive_paper
+            else EntryQualityConfig()
+        )
+        self.entry_quality = EntryQualityGate(quality_config)
         self.strategy_selector = StrategyEnsembleSelector()
         self.funnel = SignalFunnelTelemetry()
 
-        # Engineering Defect Fix Components
-        self.liquidity_gate = LiquidityGate(LiquidityGateConfig())
+        # Engineering Defect Fix Components. In the quality-first paper profile,
+        # shallow books may reach execution-aware sizing, which will reduce the
+        # order to safe visible depth instead of rejecting the symbol globally.
+        liquidity_config = (
+            LiquidityGateConfig(
+                max_spread_bps=25.0,
+                min_top_book_notional=100.0,
+                min_cumulative_book_notional=1500.0,
+                min_quote_volume_24h=250_000.0,
+                min_market_quality_score=0.30,
+            )
+            if aggressive_paper
+            else LiquidityGateConfig()
+        )
+        self.liquidity_gate = LiquidityGate(liquidity_config)
         self.execution_estimator = ExecutionEstimator(
             max_entry_slippage_bps=25.0,
             max_exit_slippage_bps=35.0,
@@ -301,7 +340,18 @@ class PaperTradingOrchestrator:
                 ),
             )
         )
-        self.strategy_risk = StrategyRiskManager(StrategyRiskConfig())
+        strategy_risk_config = (
+            StrategyRiskConfig(
+                max_strategy_consecutive_losses=2,
+                strategy_cooldown_seconds=3600.0,
+                min_trades_for_allocation_adjustment=8,
+                minimum_allocation_multiplier=0.25,
+                negative_expectancy_allocation_multiplier=0.50,
+            )
+            if aggressive_paper
+            else StrategyRiskConfig()
+        )
+        self.strategy_risk = StrategyRiskManager(strategy_risk_config)
 
         self._persist: PaperPersistence | None = None
         self._lease: _RuntimeLease | None = None
@@ -1767,6 +1817,16 @@ class PaperTradingOrchestrator:
             )
             if not expected_edge.is_positive_after_costs:
                 self._record_entry_rejection("expected_edge", strategy_id=strategy_id, symbol=sym)
+                continue
+            if self._aggressive_paper and not _reward_risk_is_acceptable(
+                expected_edge.expected_gross_edge_fraction,
+                expected_edge.costs.estimated_round_trip_cost_fraction,
+                self.risk_engine.default_stop_loss_pct,
+            ):
+                # The previous run accepted ~0.50% gross reward while modeled
+                # costs plus the stop exceeded ~0.60%, producing poor payoff
+                # even before prediction error. Quality-first mode forbids it.
+                self._record_entry_rejection("reward_risk", strategy_id=strategy_id, symbol=sym)
                 continue
 
             opp.signal.metadata.update({
