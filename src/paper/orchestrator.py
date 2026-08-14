@@ -61,12 +61,17 @@ from src.opportunity.engine import OpportunityEngine
 from src.paper.account import CLOSED_TRADE_RAM_LIMIT, ClosedTrade, PaperAccount, PaperPosition
 from src.paper.engine import PaperExecutionEngine
 from src.paper.position_monitor import PositionMonitor
-from src.paper.reporting import exit_analysis, finite_report_value, grouped_trade_metrics, trade_metrics
+from src.paper.reporting import (
+    exit_analysis,
+    finite_report_value,
+    grouped_trade_metrics,
+    trade_metrics,
+)
 from src.paper.telemetry import SignalFunnelTelemetry
 from src.portfolio.allocator import AllocatorConfig, CapitalAllocator, PortfolioState
 from src.portfolio.capacity import PositionCapacity
-from src.portfolio.conviction_sizing import ConvictionSizer, ConvictionSizingConfig
 from src.portfolio.capital_tiers import CapitalTierConfig, CapitalTierManager
+from src.portfolio.conviction_sizing import ConvictionSizer, ConvictionSizingConfig
 from src.portfolio.liquidity import LiquidityAnalyzer
 from src.portfolio.markets import AssetQualityFilter, QualityFilterConfig
 from src.portfolio.universe import UniverseConfig, UniverseManager
@@ -169,6 +174,7 @@ class PaperTradingOrchestrator:
         max_symbols: int = 50,
         db_path: str = "data/paper_trading.db",
         activity_test: bool = False,
+        aggressive_paper: bool = False,
     ) -> None:
         raw_symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         self._raw_to_canonical: dict[str, str] = {}
@@ -181,6 +187,7 @@ class PaperTradingOrchestrator:
         self.max_symbols = max_symbols
         self._db_path = db_path
         self._activity_test = activity_test
+        self._aggressive_paper = aggressive_paper
         self._last_test_signal_time: float = 0.0
 
         self.event_bus = EventBus(default_max_queue=500)
@@ -198,8 +205,29 @@ class PaperTradingOrchestrator:
             min_net_return=self._paper_config.min_expected_edge_over_cost
         )
         self.risk_engine = RiskEngine()
-        self.tier_manager = CapitalTierManager(CapitalTierConfig())
-        self.allocator = CapitalAllocator(AllocatorConfig())
+        if aggressive_paper:
+            # PAPER ONLY: deploy the simulated balance across independently gated
+            # slots without leverage or bypassing quality/liquidity/risk checks.
+            slot_count = 20
+            self.risk_engine.max_total_exposure_usd = initial_balance
+            self.risk_engine.max_position_size_usd = initial_balance / 10.0
+            self.risk_engine.max_positions_per_strategy = slot_count
+            tier_config = CapitalTierConfig(
+                slots_level_1=slot_count, slots_level_2=slot_count,
+                slots_level_3=slot_count, slots_level_4=slot_count,
+                active_capital_pct=100.0, max_tier_c_slot_pct=50.0,
+            )
+            allocator_config = AllocatorConfig(
+                reserve_pct=0.0, max_single_position_pct=10.0,
+                max_single_asset_pct=10.0, max_single_strategy_pct=100.0,
+                max_single_exchange_pct=100.0, max_correlated_exposure_pct=40.0,
+                max_positions_limit=slot_count, risk_budget_fraction=1.0,
+            )
+        else:
+            tier_config = CapitalTierConfig()
+            allocator_config = AllocatorConfig()
+        self.tier_manager = CapitalTierManager(tier_config)
+        self.allocator = CapitalAllocator(allocator_config)
         self.conviction_sizer = ConvictionSizer(
             ConvictionSizingConfig(
                 enabled=self._paper_config.high_conviction_sizing_enabled,
@@ -273,7 +301,7 @@ class PaperTradingOrchestrator:
         self._health_recovery_counter: dict[str, int] = {}
 
         self._running = False
-        self._scan_interval = 5.0
+        self._scan_interval = 2.0 if aggressive_paper else 5.0
         self._report_interval = 60.0
         self._start_time = 0.0
         self._wall_start: datetime | None = None
@@ -1584,6 +1612,17 @@ class PaperTradingOrchestrator:
             if not is_strat_eligible:
                 self._record_entry_rejection("strategy_risk", strategy_id=strategy_id, symbol=sym)
                 continue
+
+            if self._aggressive_paper:
+                # Fill the remaining simulated slot budget evenly. If all 20
+                # qualified slots fill, this targets 100% paper utilization;
+                # downstream liquidity/execution gates may still reduce it.
+                remaining_slots = max(1, available - opened_this_tick)
+                opp.signal.required_capital = min(
+                    self.risk_engine.max_position_size_usd,
+                    self.account.state.cash / remaining_slots,
+                )
+                opp.signal.metadata["paper_utilization_target"] = 1.0
 
             self._risk_assessments += 1
             risk = self.risk_engine.assess(opp)

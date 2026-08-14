@@ -212,7 +212,7 @@ class KuCoinPublicAdapter:
         tickers: dict[str, dict[str, Any]],
         *,
         min_volume_usd: float = 100_000.0,
-        max_symbols: int = 100,
+        max_symbols: int = 300,
         max_spread_bps: float = 35.0,
     ) -> list[str]:
         """Select a feed-budget-compatible, liquid universe from live data.
@@ -224,7 +224,7 @@ class KuCoinPublicAdapter:
         target: it keeps a compact, liquid set whose books can be refreshed
         within the stale-data budget.
         """
-        if max_symbols <= 0:
+        if max_symbols < 0:
             return []
         eligible = self.filter_liquid_usdt_pairs(symbols)
         ranked: list[tuple[int, float, str]] = []
@@ -251,7 +251,9 @@ class KuCoinPublicAdapter:
             ranked.append((priority_rank, -volume, symbol))
 
         ranked.sort()
-        selected = [symbol for _, _, symbol in ranked[:max_symbols]]
+        # Zero explicitly means all candidates that passed live liquidity filters.
+        pool = ranked if max_symbols == 0 else ranked[:max_symbols]
+        selected = [symbol for _, _, symbol in pool]
         logger.info(
             "kucoin_ranked_liquid_universe",
             metadata_eligible=len(eligible),

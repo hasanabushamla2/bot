@@ -21,12 +21,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 SYMBOL_STATS: dict[str, dict] = {}
 
-# Feed-budget defaults: 25 books every 3s means 100 symbols receive a full
-# order-book refresh in about 12 seconds, well inside the 45-second stale-data
-# protection.  This is not a desired trades/hour setting.
-DEFAULT_MAX_SYMBOLS = 100
+# Feed-budget defaults: broaden the liquid universe while scaling book batches
+# so a larger selection is refreshed predictably. This is not a desired
+# trades/hour setting.
+DEFAULT_MAX_SYMBOLS = 300
 DEFAULT_MIN_VOLUME_USD = 100_000.0
 DEFAULT_MAX_SPREAD_BPS = 35.0
+DEFAULT_BOOK_REFRESH_BUDGET_SECONDS = 30.0
+DEFAULT_BOOK_BATCH_INTERVAL_SECONDS = 2.0
 
 
 def _kucoin_safety_proof() -> None:
@@ -50,8 +52,11 @@ async def _universe_feed(
     Uses KuCoin's /api/v1/market/allTickers for efficient mass polling
     (~1 request for all prices), then fetches order books in batches.
     """
-    batch_size = 25  # symbols per book-fetch cycle
-    book_interval = 3.0  # seconds between book-fetch cycles
+    # Scale the batch so every selected book is revisited inside the
+    # freshness budget instead of making most of a broad universe stale.
+    book_interval = DEFAULT_BOOK_BATCH_INTERVAL_SECONDS
+    batches_per_budget = max(1, int(DEFAULT_BOOK_REFRESH_BUDGET_SECONDS / book_interval))
+    batch_size = max(25, (len(symbols) + batches_per_budget - 1) // batches_per_budget)
 
     sym_list = list(symbols)
     book_idx = 0
@@ -114,6 +119,8 @@ async def run_live_paper(
     was_auto_detected: bool = True,
     db_path: str | None = None,
     fresh_db: bool = False,
+    initial_balance: float = 10_000.0,
+    aggressive_paper: bool = True,
 ) -> int:
     from src.adapters.crypto.kucoin import KuCoinPublicAdapter
     from src.core.logging_config import setup_logging
@@ -149,9 +156,9 @@ async def run_live_paper(
     print(f"  Connected to KuCoin — monitoring {len(symbols)} symbols")
 
     orch = PaperTradingOrchestrator(
-        symbols=symbols, initial_balance=10000,
+        symbols=symbols, initial_balance=initial_balance,
         max_symbols=len(symbols), db_path=db_path,
-        activity_test=activity_test,
+        activity_test=activity_test, aggressive_paper=aggressive_paper,
     )
 
     wall_start = datetime.now(UTC)
@@ -245,6 +252,11 @@ async def main() -> None:
         help="Delete only the selected paper DB (plus WAL/SHM) before starting",
     )
     parser.add_argument("--activity-test", action="store_true")
+    parser.add_argument("--initial-balance", type=float, default=10_000.0)
+    parser.add_argument(
+        "--profile", choices=("safe", "aggressive-paper"), default="aggressive-paper",
+        help="Paper-only profile that can deploy 100%% across diversified positions.",
+    )
     parser.add_argument(
         "--max-symbols",
         type=int,
@@ -264,8 +276,10 @@ async def main() -> None:
         help="Maximum current top-of-book spread for automatic-universe candidates.",
     )
     args = parser.parse_args()
-    if args.max_symbols <= 0:
-        parser.error("--max-symbols must be positive")
+    if args.max_symbols < 0:
+        parser.error("--max-symbols must be zero (all eligible) or positive")
+    if args.initial_balance <= 0:
+        parser.error("--initial-balance must be positive")
     if args.min_volume_usd < 0:
         parser.error("--min-volume-usd must be non-negative")
     if args.max_spread_bps <= 0:
@@ -315,7 +329,8 @@ async def main() -> None:
             return
         print(
             f"Dynamic universe: {len(all_syms)} metadata → {len(symbols)} current-liquid USDT pairs "
-            f"(cap={args.max_symbols}, min volume=${args.min_volume_usd:,.0f}, "
+            f"(cap={'all eligible' if args.max_symbols == 0 else args.max_symbols}, "
+            f"min volume=${args.min_volume_usd:,.0f}, "
             f"max spread={args.max_spread_bps:.1f}bps)"
         )
 
@@ -328,6 +343,8 @@ async def main() -> None:
     print(f"  Symbols:       {len(symbols)} ({'specified' if args.symbols else 'auto-detected'})")
     print(f"  Duration:      {args.duration}s")
     print(f"  Experiment:    {exp_id}")
+    print(f"  Profile:       {args.profile}")
+    print(f"  Paper balance: ${args.initial_balance:,.2f}")
     print("  REAL ORDERS:   DISABLED")
     print("=" * 70)
     print()
@@ -340,6 +357,8 @@ async def main() -> None:
         activity_test=args.activity_test,
         db_path=args.db_path or None,
         fresh_db=args.fresh_db,
+        initial_balance=args.initial_balance,
+        aggressive_paper=args.profile == "aggressive-paper",
     )
     sys.exit(exit_code)
 

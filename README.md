@@ -137,3 +137,27 @@ MIT
 🟢 **Phase 1 COMPLETE** — Architecture, interfaces, database models, test infrastructure.
 
 ⬜ Phase 2 — Market data engine implementation (NOT STARTED — awaiting authorization).
+
+## High-Activity Paper Profile
+
+The KuCoin public-data runner is simulation-only and defaults to the explicit
+`aggressive-paper` profile. It can deploy up to 100% of the simulated balance,
+but distributes exposure across up to 20 independently gated positions. It
+keeps 1x spot-only execution, hard stops, liquidity/cost checks, correlation
+controls, and the circuit breaker enabled.
+
+```bash
+# Broad liquid universe (default cap: 300), simulated $10,000
+python scripts/run_live_paper.py --duration 3600 --fresh-db
+
+# Every currently eligible pair; the order-book refresh batch scales with size
+python scripts/run_live_paper.py --duration 3600 --max-symbols 0 --fresh-db
+
+# Conservative allocation profile
+python scripts/run_live_paper.py --profile safe --duration 3600 --fresh-db
+```
+
+A larger universe and faster two-second scan cadence create more opportunities;
+they do not guarantee more trades, a particular win rate, or profitability.
+Evaluate results over multiple market regimes using the persisted paper database
+before changing any entry-quality threshold.

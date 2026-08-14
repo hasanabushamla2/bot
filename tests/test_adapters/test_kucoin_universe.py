@@ -52,3 +52,24 @@ def test_ranked_liquid_universe_returns_empty_when_no_live_candidate_is_safe() -
         max_symbols=100,
     )
     assert selected == []
+
+
+def test_zero_symbol_cap_selects_every_live_eligible_pair() -> None:
+    adapter = KuCoinPublicAdapter()
+    symbols = [
+        _symbol("AAA-USDT", base="AAA"),
+        _symbol("BBB-USDT", base="BBB"),
+        _symbol("CCC-USDT", base="CCC"),
+    ]
+    tickers = {
+        symbol["symbol"]: {
+            "bid": 10.0,
+            "ask": 10.01,
+            "volume_24h_usd": 1_000_000.0 + index,
+        }
+        for index, symbol in enumerate(symbols)
+    }
+
+    selected = adapter.rank_liquid_usdt_pairs(symbols, tickers, max_symbols=0)
+
+    assert set(selected) == {"AAA-USDT", "BBB-USDT", "CCC-USDT"}
