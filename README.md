@@ -169,3 +169,17 @@ A larger universe and faster two-second scan cadence create more opportunities;
 they do not guarantee more trades, a particular win rate, or profitability.
 Evaluate results over multiple market regimes using the persisted paper database
 before changing any entry-quality threshold.
+
+## Global Multi-Exchange Paper Mode
+
+The global runner discovers liquid USDT spot assets across Binance, KuCoin, OKX,
+Bybit, Gate.io, and MEXC, then assigns each asset to its best current venue to
+avoid duplicate exposure:
+
+```bash
+python scripts/run_global_paper.py --duration 43200 --initial-balance 10000 --fresh-db
+```
+
+Unavailable or geographically blocked exchanges are reported and skipped while
+accessible venues continue. See [GLOBAL_MARKETS.md](GLOBAL_MARKETS.md) for the
+OANDA Practice pricing configuration for FX and gold.

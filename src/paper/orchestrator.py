@@ -196,12 +196,14 @@ class PaperTradingOrchestrator:
         db_path: str = "data/paper_trading.db",
         activity_test: bool = False,
         aggressive_paper: bool = False,
+        exchange_name: str = "binance",
     ) -> None:
         raw_symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+        self.exchange_name = exchange_name
         self._raw_to_canonical: dict[str, str] = {}
         self._canonical_symbols: list[str] = []
         for raw in raw_symbols:
-            canonical = CanonicalSymbol.from_exchange_symbol("binance", raw).symbol
+            canonical = CanonicalSymbol.from_exchange_symbol(self.exchange_name, raw).symbol
             self._canonical_symbols.append(canonical)
             self._raw_to_canonical[raw.upper()] = canonical
         self.initial_balance = initial_balance
@@ -474,7 +476,7 @@ class PaperTradingOrchestrator:
         self.subscriber_count = 1
 
         for canonical in self._canonical_symbols:
-            a = self.universe.register(canonical, "binance")
+            a = self.universe.register(canonical, self.exchange_name)
             a.data_healthy = True
             a.last_data_at = datetime.now(UTC)
 
@@ -1016,7 +1018,7 @@ class PaperTradingOrchestrator:
         vol = float(getattr(event, "volume_24h", 0))
         if last <= 0:
             return
-        self.feed_health.record_message("binance", sym, "ticker", exchange_ts=datetime.now(UTC))
+        self.feed_health.record_message(self.exchange_name, sym, "ticker", exchange_ts=datetime.now(UTC))
         self.features.update_price(sym, last)
         current_features = self.features.get(sym)
         self.features.update_order_book(
@@ -1037,7 +1039,7 @@ class PaperTradingOrchestrator:
         canonical = self._raw_to_canonical.get(raw_symbol.upper(), raw_symbol.upper())
         parts = canonical.split("-") if "-" in canonical else [canonical[:3], canonical[3:]]
         ticker_event = TickerEvent.create(
-            "binance", CanonicalSymbol("binance", parts[0], parts[-1]),
+            self.exchange_name, CanonicalSymbol(self.exchange_name, parts[0], parts[-1]),
             bid, ask, last, volume_24h=volume_24h,
         )
         with contextlib.suppress(RuntimeError):
@@ -1048,7 +1050,7 @@ class PaperTradingOrchestrator:
         self, raw_symbol: str, bids: list[tuple[float, float]], asks: list[tuple[float, float]]
     ) -> None:
         canonical = self._raw_to_canonical.get(raw_symbol.upper(), raw_symbol.upper())
-        book = self.order_book_engine.get_or_create("binance", canonical)
+        book = self.order_book_engine.get_or_create(self.exchange_name, canonical)
         if bids:
             book.bids.apply_snapshot([BookLevel(p, q) for p, q in bids[:50]])
         if asks:
@@ -1064,13 +1066,13 @@ class PaperTradingOrchestrator:
                 canonical, book.best_bid, book.best_ask, bid_depth, ask_depth
             )
         self._book_events_received += 1
-        self.feed_health.record_message("binance", canonical, "book", exchange_ts=datetime.now(UTC))
+        self.feed_health.record_message(self.exchange_name, canonical, "book", exchange_ts=datetime.now(UTC))
 
     def _annotate_signal_cost(self, signal: Any) -> None:
         """Attach cost facts from the configured fill model; never invent edge."""
         symbol = signal.symbol or ""
         feat = self.features.get(symbol)
-        book = self.order_book_engine.get_book("binance", symbol)
+        book = self.order_book_engine.get_book(self.exchange_name, symbol)
         entry_reference = (
             book.best_ask if book and book.best_ask > 0 else feat.ask
         )
@@ -1196,7 +1198,7 @@ class PaperTradingOrchestrator:
             if pos_data is None:
                 continue
             qty = pos_data.quantity
-            book = self.order_book_engine.get_book("binance", sym)
+            book = self.order_book_engine.get_book(self.exchange_name, sym)
             bids_depth = [(lv[0], lv[1]) for lv in (book.bids.levels if book else [])] if book else None
             exit_bid = book.best_bid if book and book.best_bid > 0 else self._get_bid(sym)
             exit_ask = book.best_ask if book and book.best_ask > 0 else ex["price"]
@@ -1277,7 +1279,7 @@ class PaperTradingOrchestrator:
                 self._total_trades += 1
                 self.analytics.record_trade(trade.gross_pnl, trade.net_pnl, trade.fees,
                                             slippage=trade.slippage_cost,
-                                            strategy_id=trade.strategy_id, exchange="binance")
+                                            strategy_id=trade.strategy_id, exchange=self.exchange_name)
                 self._trade_log.append({"symbol": sym, "reason": ex["reason"],
                                         "pnl": trade.net_pnl,
                                         "time": datetime.now(UTC).isoformat()})
@@ -1362,7 +1364,7 @@ class PaperTradingOrchestrator:
 
             # Check Feed Health.  Do not silently turn an unhealthy feed into
             # a lack of signals; it is a stale-market safety rejection.
-            ticker_health = self.feed_health.get("binance", canonical, "ticker")
+            ticker_health = self.feed_health.get(self.exchange_name, canonical, "ticker")
             if ticker_health and not ticker_health.is_healthy:
                 self._record_pipeline_rejection("stale_market", symbol=canonical)
                 continue
@@ -1374,7 +1376,7 @@ class PaperTradingOrchestrator:
             data_age = max(0.0, (datetime.now(UTC) - feat.updated_at).total_seconds())
 
             # Evaluate Liquidity Gate
-            book = self.order_book_engine.get_book("binance", canonical)
+            book = self.order_book_engine.get_book(self.exchange_name, canonical)
             self._liquidity_checks += 1
             lq_eval = self.liquidity_gate.assess_market(
                 canonical, book, feat.volume_24h, data_age,
@@ -1397,7 +1399,7 @@ class PaperTradingOrchestrator:
             # Build qualified AssetSnapshot
             depth_10bps = book.depth_within_bps(10) if book else 0.0
             snapshots.append(AssetSnapshot(
-                symbol=canonical, exchange="binance", asset_class=AssetClass.CRYPTO_SPOT,
+                symbol=canonical, exchange=self.exchange_name, asset_class=AssetClass.CRYPTO_SPOT,
                 last_price=feat.last_price, bid=feat.bid, ask=feat.ask,
                 spread_pct=lq_eval.spread_bps / 100.0, volume_24h=feat.volume_24h,
                 price_change_1m_pct=feat.return_1m_pct,
@@ -1610,7 +1612,7 @@ class PaperTradingOrchestrator:
             positions={symbol: pos.notional for symbol, pos in open_positions.items()},
             asset_exposure=asset_exposure,
             strategy_exposure=strategy_exposure,
-            exchange_exposure={"binance": self.account.state.allocated},
+            exchange_exposure={self.exchange_name: self.account.state.allocated},
             active_symbols=set(open_positions.keys()),
             total_exposure_pct=(
                 self.account.state.allocated / max(self.account.state.equity, 1e-9) * 100.0
@@ -1705,7 +1707,7 @@ class PaperTradingOrchestrator:
                 continue
 
             feat = self.features.get(sym)
-            book = self.order_book_engine.get_book("binance", sym)
+            book = self.order_book_engine.get_book(self.exchange_name, sym)
             if not book or not book.asks.levels or not book.bids.levels:
                 self._record_entry_rejection("missing_book", strategy_id=strategy_id, symbol=sym)
                 continue
@@ -2014,7 +2016,7 @@ class PaperTradingOrchestrator:
             self.analytics.record_allocation(
                 sym,
                 opp.signal.strategy_id,
-                "binance",
+                self.exchange_name,
                 fill_price * quantity,
             )
             self._trade_log.append({
@@ -2066,7 +2068,7 @@ class PaperTradingOrchestrator:
             feat = self.features.get(s)
             if feat.last_price <= 0 or feat.ask <= 0:
                 continue
-            bk = self.order_book_engine.get_book("binance", s)
+            bk = self.order_book_engine.get_book(self.exchange_name, s)
             if bk is not None and bool(bk.bids.levels) and bool(bk.asks.levels):
                 lq = self.liquidity_gate.assess_market(s, bk, feat.volume_24h, 1.0)
                 if lq.passed:

@@ -46,6 +46,17 @@ def test_aggressive_allocation_divides_cash_by_actual_candidates() -> None:
     assert _aggressive_paper_allocation(10_000.0, 5_000.0, 20, 1) == (5_000.0, 1)
 
 
+def test_orchestrator_preserves_real_exchange_identity(tmp_path) -> None:
+    orchestrator = PaperTradingOrchestrator(
+        symbols=["ACE-USDT"],
+        exchange_name="kucoin",
+        db_path=str(tmp_path / "kucoin.db"),
+    )
+
+    assert orchestrator.exchange_name == "kucoin"
+    assert orchestrator._raw_to_canonical["ACE-USDT"] == "ACE-USDT"
+
+
 def test_default_orchestrator_keeps_conservative_profile(tmp_path) -> None:
     orchestrator = PaperTradingOrchestrator(symbols=["BTCUSDT"], db_path=str(tmp_path / "safe.db"))
 
